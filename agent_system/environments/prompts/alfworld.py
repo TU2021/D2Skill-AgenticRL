@@ -35,18 +35,91 @@ You should first reason step-by-step about the current situation. This reasoning
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
+# ALFWORLD_TEMPLATE_WITH_MEMORY = """
+# You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
+
+# ## Current Progress
+
+# Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
+# You are now at step {current_step} and your current observation is: {current_observation}
+# Your admissible actions of the current situation are: [{admissible_actions}].
+
+# Below are past experiences retrieved from memory that may be relevant to the current situation.
+# You MUST carefully read these experiences before deciding your next action.
+# When reasoning, you should:
+# - Compare the current situation with past experiences
+# - Reuse successful actions if the situations are similar
+# - Avoid actions that previously led to failure
+# - Use past experience to plan a better next step
+# - If a memory looks useful, explicitly consider it in your reasoning
+# Do NOT ignore the retrieved experience unless it is clearly irrelevant.
+
+# ## Relevant Experience
+
+# {retrieved_memories}
+
+# Now it's your turn to take an action.
+# You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+# Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+# """
+
 ALFWORLD_TEMPLATE_WITH_MEMORY = """
-You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
+You are an expert decision-making agent operating in the ALFRED embodied environment.
 
-## Retrieved Relevant Experience
+Your goal is to complete the following task:
+{task_description}
 
+
+====================
+## Current Progress
+====================
+
+You have already taken {step_count} step(s).
+
+Recent interaction history (observation → action):
+{action_history}
+
+Current step: {current_step}
+
+Current observation:
+{current_observation}
+
+Admissible actions at this step:
+[{admissible_actions}]
+
+
+====================
+## Relevant Experience
+====================
+
+Below are past experiences retrieved from memory. They may include:
+
+- **Task-level experience**: for this kind of task as a whole (what to aim for, what to avoid).
+- **Step-level experience**: for the current situation (what to do at this step when the observation is similar).
+
+You should review both before deciding your next action.
+
+When reasoning, you may:
+
+- Use task-level experience to guide your overall plan and avoid known pitfalls
+- Use step-level experience when the current observation matches the described situation
+- Reuse successful actions if the situations are similar; avoid actions that previously led to failure
+
+Warning: These lessons may be outdated. Use them only if they align with your current observation.
+
+Retrieved experiences:
 {retrieved_memories}
 
-## Current Progress
 
-Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
-You are now at step {current_step} and your current observation is: {current_observation}
-Your admissible actions of the current situation are: [{admissible_actions}].
+====================
+## Instructions
+====================
+
+For the current step, you should follow this process:
+
+1. Analyze the current observation
+2. Review the retrieved experiences and think about whether any past experience applies
+3. Reason step-by-step and choose the best admissible action
 
 Now it's your turn to take an action.
 You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.

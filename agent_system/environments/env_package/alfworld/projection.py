@@ -40,20 +40,22 @@ def alfworld_projection(actions: List[str], action_pools: List[List[str]]):
                 actions[i] = actions[i][-30:]  # 0 is invalid action for Sokoban
                 continue
 
-            # Extract just the content between the tags
-            extracted_action = actions[i][start_idx + len(start_tag):end_idx].strip().lower()
-            
+            # Extract content between the tags; normalize whitespace (newlines, tabs,
+            # multiple spaces) to a single space so that "<action>\ngo to drawer 1\n</action>" works
+            raw_content = actions[i][start_idx + len(start_tag):end_idx]
+            extracted_action = re.sub(r"\s+", " ", raw_content).strip().lower()
+
             actions[i] = extracted_action
             valids[i] = 1
 
-        except:
+        except Exception:
             actions[i] = actions[i][-30:]
 
-        # check <think>...</think>
+        # <think>...</think> is optional: having <action>...</action> is enough for valid
         think_start_idx = original_str.find("<think>")
         think_end_idx = original_str.find("</think>")
         if think_start_idx == -1 or think_end_idx == -1:
-            valids[i] = 0
+            pass  # no longer mark invalid; action block alone is sufficient
 
         # check if contains any Chinese characters
         if re.search(r'[\u4e00-\u9fff]', original_str):

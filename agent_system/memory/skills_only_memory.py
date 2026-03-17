@@ -29,7 +29,7 @@ Supports two retrieval modes:
 
 import json
 import os
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from .base import BaseMemory
 
 
@@ -57,41 +57,93 @@ class SkillsOnlyMemory(BaseMemory):
 
     def __init__(
         self,
-        skills_json_path: str,
+        skills_json_path: Optional[str] = None,
         retrieval_mode: str = "template",
         embedding_model_path: Optional[str] = None,
         task_specific_top_k: Optional[int] = None,
+        device: Optional[str] = None,
+        skill_retrieval_service_url: Optional[Union[str, List[str]]] = None,
+        num_gpus: int = 1,
+        skill_text_for_retrieval: str = "full",
+        load_initial_skills: bool = True,
+        similarity_threshold: Optional[float] = None,
     ):
         """
         Args:
-            skills_json_path:     Path to Claude-style skills JSON file.
+            skills_json_path:     Path to Claude-style skills JSON file. Can be None when load_initial_skills=False.
             retrieval_mode:       ``"template"`` or ``"embedding"``.
+            skill_text_for_retrieval: Which skill fields to use as document input.
+                                  ``"full"`` = title + principle + when_to_apply (default);
+                                  ``"when_to_apply"`` = only when_to_apply.
+            load_initial_skills:  If False, do not load from skills_json_path; start with empty skill bank.
+            similarity_threshold: If set (embedding mode), only return skills with similarity >= this value.
             embedding_model_path: Local path (or HF model ID) for the
                                   SentenceTransformer embedding model.  Only
-                                  used when ``retrieval_mode="embedding"``.
+                                  used when ``retrieval_mode="embedding"`` and
+                                  ``skill_retrieval_service_url`` is not set.
                                   Defaults to ``"Qwen/Qwen3-Embedding-0.6B"``.
             task_specific_top_k:  Maximum number of task-specific skills to
                                   return.  ``None`` means *return all* in
                                   template mode and use ``top_k`` (general
                                   skills count) in embedding mode.
+            device:               Device for the embedding model when running
+                                  in-process (e.g. ``"cuda:0"``, ``"cpu"``).
+                                  Only used when ``retrieval_mode="embedding"``
+                                  and ``skill_retrieval_service_url`` is None.
+                                  Defaults to SentenceTransformer default (often cuda:0).
+            skill_retrieval_service_url: If set, retrieval is done via HTTP
+                                  to this URL or list of URLs (batch endpoint).
+                                  When a list (e.g. 8 URLs for 8 GPUs), queries
+                                  are split across URLs and requested in parallel
+                                  (e.g. 128 queries -> 8×16 to 8 servers).
+                                  No local embedding model is loaded.
+            num_gpus:             When > 1 and not using remote URL, load this many
+                                  embedding models on cuda:0..num_gpus-1 and
+                                  encode query batches in parallel (one URL server
+                                  can thus use multiple GPUs).
         """
         if retrieval_mode not in ("template", "embedding"):
             raise ValueError(
                 f"retrieval_mode must be 'template' or 'embedding', got '{retrieval_mode}'"
             )
 
-        if not os.path.exists(skills_json_path):
-            raise FileNotFoundError(f"Skills file not found: {skills_json_path}")
-
-        with open(skills_json_path, 'r') as f:
-            self.skills = json.load(f)
+        if load_initial_skills:
+            if not skills_json_path or not os.path.exists(skills_json_path):
+                raise FileNotFoundError(f"Skills file not found: {skills_json_path}")
+            with open(skills_json_path, 'r') as f:
+                self.skills = json.load(f)
+        else:
+            self.skills = {"general_skills": [], "task_specific_skills": {}, "common_mistakes": []}
 
         self.retrieval_mode = retrieval_mode
         self.embedding_model_path = embedding_model_path or "Qwen/Qwen3-Embedding-0.6B"
         self.task_specific_top_k = task_specific_top_k
+        self.device = device
+        self._num_gpus = max(1, int(num_gpus)) if not getattr(num_gpus, "__iter__", None) else 1
+        # Normalize to list of URLs for single or multi-server parallel retrieval
+        raw_url = skill_retrieval_service_url
+        if raw_url is None:
+            self._retrieval_service_urls = None
+        elif isinstance(raw_url, str):
+            u = raw_url.strip()
+            self._retrieval_service_urls = [u] if u else None
+        else:
+            # list, tuple, or OmegaConf ListConfig
+            self._retrieval_service_urls = [str(u).strip() for u in raw_url if (u or "").strip()]
+            if not self._retrieval_service_urls:
+                self._retrieval_service_urls = None
 
-        # Lazy-initialised embedding state (only used in embedding mode)
+        if skill_text_for_retrieval not in ("full", "when_to_apply"):
+            raise ValueError(
+                f"skill_text_for_retrieval must be 'full' or 'when_to_apply', got '{skill_text_for_retrieval}'"
+            )
+        self._skill_text_for_retrieval = skill_text_for_retrieval
+        self.load_initial_skills = load_initial_skills
+        self.similarity_threshold = similarity_threshold
+
+        # Lazy-initialised embedding state (only used in embedding mode, in-process)
         self._embedding_model = None
+        self._embedding_models: Optional[List[Any]] = None  # when _num_gpus > 1
         self._skill_embeddings_cache: Optional[Dict] = None
 
         n_general = len(self.skills.get('general_skills', []))
@@ -101,11 +153,12 @@ class SkillsOnlyMemory(BaseMemory):
             f"[SkillsOnlyMemory] Loaded skills: {n_general} general, "
             f"{n_task} task-specific, {n_mistakes} mistakes  "
             f"| retrieval_mode={retrieval_mode}"
+            + (f" | remote={len(self._retrieval_service_urls)} server(s)" if self._retrieval_service_urls else "")
+            + (f" | num_gpus={self._num_gpus}" if self._num_gpus > 1 else "")
         )
 
-        # In embedding mode, pre-compute skill embeddings eagerly so the first
-        # retrieve() call is not slower than subsequent ones.
-        if retrieval_mode == "embedding":
+        # In embedding mode without remote URL, pre-compute skill embeddings eagerly.
+        if retrieval_mode == "embedding" and not self._retrieval_service_urls:
             self._compute_skill_embeddings()
 
     # ------------------------------------------------------------------ #
@@ -181,41 +234,79 @@ class SkillsOnlyMemory(BaseMemory):
     # ------------------------------------------------------------------ #
 
     def _get_embedding_model(self):
-        """Lazy-load the SentenceTransformer model (thread-safe for single process)."""
+        """Lazy-load the SentenceTransformer model(s). When _num_gpus > 1, load one per GPU and return the first."""
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for embedding retrieval. "
+                "Install with: pip install sentence-transformers"
+            )
+        # Prefer GPU when available; fall back to CPU
+        target_device = self.device
+        if not target_device:
+            target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif str(target_device).startswith("cuda") and not torch.cuda.is_available():
+            target_device = "cpu"
+            print(f"[SkillsOnlyMemory] CUDA not available, using CPU for embedding model.")
+
+        if self._num_gpus > 1 and torch.cuda.is_available():
+            if self._embedding_models is None:
+                n = min(self._num_gpus, torch.cuda.device_count())
+                print(f"[SkillsOnlyMemory] Loading {n} embedding models on cuda:0..{n-1}")
+                self._embedding_models = [
+                    SentenceTransformer(self.embedding_model_path, device=f"cuda:{i}")
+                    for i in range(n)
+                ]
+                self._embedding_model = self._embedding_models[0]
+                print(f"[SkillsOnlyMemory] {n} embedding models ready.")
+            return self._embedding_models[0]
         if self._embedding_model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-            except ImportError:
-                raise ImportError(
-                    "sentence-transformers is required for embedding retrieval. "
-                    "Install with: pip install sentence-transformers"
-                )
-            print(f"[SkillsOnlyMemory] Loading embedding model: {self.embedding_model_path}")
-            self._embedding_model = SentenceTransformer(self.embedding_model_path)
-            print("[SkillsOnlyMemory] Embedding model ready.")
+            print(f"[SkillsOnlyMemory] Loading embedding model: {self.embedding_model_path} on {target_device}")
+            self._embedding_model = SentenceTransformer(self.embedding_model_path, device=target_device)
+            print(f"[SkillsOnlyMemory] Embedding model ready on {target_device}.")
         return self._embedding_model
 
-    @staticmethod
-    def _skill_to_text(skill: Dict[str, Any]) -> str:
-        """Concatenate the skill fields most useful for semantic matching."""
+    def _skill_to_text(self, skill: Dict[str, Any], mode: Optional[str] = None) -> str:
+        """Build the text used as document input for retrieval. mode overrides self._skill_text_for_retrieval."""
+        use = (mode or self._skill_text_for_retrieval)
+        if use == "when_to_apply":
+            return (skill.get("when_to_apply") or "").strip()
         parts = []
-        for field in ('title', 'principle', 'when_to_apply'):
-            val = skill.get(field, '').strip()
+        for field in ("title", "principle", "when_to_apply"):
+            val = (skill.get(field) or "").strip()
             if val:
                 parts.append(val)
         return ". ".join(parts)
 
-    def _compute_skill_embeddings(self) -> Dict:
+    def _apply_similarity_threshold(
+        self,
+        general_skills: List[Dict[str, Any]],
+        task_specific_skills: List[Dict[str, Any]],
+    ) -> tuple:
+        """If similarity_threshold is set (embedding mode), keep only skills with similarity >= threshold."""
+        if self.similarity_threshold is None:
+            return general_skills, task_specific_skills
+        th = self.similarity_threshold
+        # Only filter when we have numeric similarities (embedding mode); template mode has all None → leave as-is
+        gs = general_skills
+        ts = task_specific_skills
+        if any(s.get("similarity") is not None for s in general_skills + task_specific_skills):
+            gs = [s for s in general_skills if s.get("similarity") is not None and s["similarity"] >= th]
+            ts = [s for s in task_specific_skills if s.get("similarity") is not None and s["similarity"] >= th]
+        return gs, ts
+
+    def _compute_skill_embeddings(self, mode: Optional[str] = None) -> Dict:
         """
         Pre-compute and cache normalised embeddings for every skill.
-
-        The cache holds:
-          ``items``      – flat list of ``(kind, task_type, skill_dict)``
-          ``embeddings`` – numpy array of shape ``(n_skills, dim)``
-          ``n_general``  – how many of the first rows correspond to general skills
+        mode: "full" | "when_to_apply"; defaults to self._skill_text_for_retrieval. Cache is per mode.
         """
-        if self._skill_embeddings_cache is not None:
-            return self._skill_embeddings_cache
+        use_mode = mode or self._skill_text_for_retrieval
+        if self._skill_embeddings_cache is None:
+            self._skill_embeddings_cache = {}
+        if use_mode in self._skill_embeddings_cache:
+            return self._skill_embeddings_cache[use_mode]
 
         import numpy as np
 
@@ -229,26 +320,30 @@ class SkillsOnlyMemory(BaseMemory):
             for s in skills
         ]
         all_items = general_items + task_items
-        texts = [self._skill_to_text(item[2]) for item in all_items]
+        texts = [self._skill_to_text(item[2], use_mode) for item in all_items]
 
-        model = self._get_embedding_model()
-        embeddings = model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
+        if not texts:
+            # Empty skill bank: avoid model.encode([]) which may return (0,0) and break matmul later
+            embeddings = np.array([]).reshape(0, 0)
+        else:
+            model = self._get_embedding_model()
+            embeddings = model.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
 
-        self._skill_embeddings_cache = {
+        self._skill_embeddings_cache[use_mode] = {
             'items': all_items,
             'embeddings': embeddings,
             'n_general': len(general_items),
         }
         print(
-            f"[SkillsOnlyMemory] Cached embeddings for {len(all_items)} skills "
+            f"[SkillsOnlyMemory] Cached embeddings for {len(all_items)} skills (mode={use_mode}) "
             f"({len(general_items)} general + {len(task_items)} task-specific)"
         )
-        return self._skill_embeddings_cache
+        return self._skill_embeddings_cache[use_mode]
 
     def _embedding_retrieve(
         self,
@@ -273,6 +368,9 @@ class SkillsOnlyMemory(BaseMemory):
         import numpy as np
 
         cache = self._compute_skill_embeddings()
+        n_skills = cache['embeddings'].shape[0]
+        if n_skills == 0:
+            return [], [], [], []
         model = self._get_embedding_model()
 
         query_emb = model.encode(
@@ -291,12 +389,173 @@ class SkillsOnlyMemory(BaseMemory):
         # Top-k general skills
         general_idx = np.argsort(general_sims)[::-1][:top_k_general]
         general_skills = [cache['items'][int(i)][2] for i in general_idx]
+        general_scores = [float(general_sims[i]) for i in general_idx]
 
         # Top-k task-specific skills (cross-category search)
         task_idx = np.argsort(task_sims)[::-1][:top_k_task_specific]
         task_skills = [cache['items'][n_general + int(i)][2] for i in task_idx]
+        task_scores = [float(task_sims[i]) for i in task_idx]
 
-        return general_skills, task_skills
+        return general_skills, task_skills, general_scores, task_scores
+
+    def _embedding_retrieve_batch(
+        self,
+        task_descriptions: List[str],
+        top_k_general: int,
+        top_k_task_specific: int,
+        mode: Optional[str] = None,
+    ) -> List[tuple]:
+        """
+        Batch version of _embedding_retrieve: encode all queries once (or in
+        parallel across num_gpus when > 1), then compute top-k for each.
+        mode: override for skill document (full / when_to_apply); defaults to self._skill_text_for_retrieval.
+        """
+        import numpy as np
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if not task_descriptions:
+            return []
+
+        cache = self._compute_skill_embeddings(mode)
+        n_skills = cache['embeddings'].shape[0]
+        if n_skills == 0:
+            return [([], [], [], []) for _ in task_descriptions]
+
+        models = self._embedding_models if self._num_gpus > 1 and self._embedding_models else [self._get_embedding_model()]
+        n_models = len(models)
+
+        if n_models <= 1:
+            model = models[0]
+            query_embs = model.encode(
+                task_descriptions,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+        else:
+            # Split queries across GPUs and encode in parallel
+            def _encode_chunk(model, chunk):
+                if not chunk:
+                    return None
+                return model.encode(
+                    chunk,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+
+            size = len(task_descriptions)
+            chunk_size = (size + n_models - 1) // n_models
+            chunks = [
+                task_descriptions[i : i + chunk_size]
+                for i in range(0, size, chunk_size)
+            ]
+            while len(chunks) < n_models:
+                chunks.append([])
+            chunks = chunks[:n_models]
+            parts = []
+            with ThreadPoolExecutor(max_workers=n_models) as ex:
+                futs = {ex.submit(_encode_chunk, models[i], chunks[i]): i for i in range(n_models)}
+                for fut in as_completed(futs):
+                    idx = futs[fut]
+                    part = fut.result()
+                    if part is not None and getattr(part, "shape", None) and len(part.shape) > 0 and part.shape[0] > 0:
+                        parts.append((idx, part))
+            parts.sort(key=lambda x: x[0])
+            query_embs = np.vstack([p[1] for p in parts])
+        if hasattr(query_embs, 'shape') and len(query_embs.shape) == 1:
+            query_embs = np.expand_dims(query_embs, axis=0)
+        n_queries = len(task_descriptions)
+        n_general = cache['n_general']
+        n_skills = cache['embeddings'].shape[0]
+
+        sims_all = cache['embeddings'] @ query_embs.T
+        if hasattr(sims_all, 'shape') and len(sims_all.shape) == 1:
+            sims_all = np.expand_dims(sims_all, axis=1)
+
+        results = []
+        for j in range(n_queries):
+            sims = sims_all[:, j]
+            general_sims = sims[:n_general]
+            task_sims = sims[n_general:]
+            general_idx = np.argsort(general_sims)[::-1][:top_k_general]
+            task_idx = np.argsort(task_sims)[::-1][:top_k_task_specific]
+            general_skills = [cache['items'][int(i)][2] for i in general_idx]
+            task_skills = [cache['items'][n_general + int(i)][2] for i in task_idx]
+            general_scores = [float(general_sims[i]) for i in general_idx]
+            task_scores = [float(task_sims[i]) for i in task_idx]
+            results.append((general_skills, task_skills, general_scores, task_scores))
+        return results
+
+    def _remote_retrieve_batch(
+        self,
+        task_descriptions: List[str],
+        top_k: int = 6,
+        timeout: int = 60,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Call the skill retrieval HTTP service(s) for batch retrieval.
+        When multiple URLs are configured, queries are split across URLs and
+        requested in parallel (e.g. 128 queries, 8 servers -> 8×16 concurrent).
+        """
+        import requests
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        urls = self._retrieval_service_urls
+        n = len(urls)
+
+        def _normalize_url(u: str) -> str:
+            u = u.rstrip("/")
+            return u if "/retrieve_batch" in u else f"{u}/retrieve_batch"
+
+        def _request_one(url: str, queries: List[str]) -> List[Dict[str, Any]]:
+            payload = {
+                "queries": queries,
+                "top_k": top_k,
+                "task_specific_top_k": kwargs.get("task_specific_top_k") or self.task_specific_top_k,
+                "skill_text_for_retrieval": kwargs.get("skill_text_for_retrieval") or self._skill_text_for_retrieval,
+            }
+            resp = requests.post(url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            if "result" in data:
+                return data["result"]
+            return data
+
+        if n == 0:
+            return []
+        if n == 1:
+            return _request_one(_normalize_url(urls[0]), task_descriptions)
+
+        # Split queries across URLs (e.g. 128 -> 8 chunks of 16)
+        size = len(task_descriptions)
+        chunk_size = (size + n - 1) // n
+        chunks = [
+            task_descriptions[i : i + chunk_size]
+            for i in range(0, size, chunk_size)
+        ]
+        # Pad to n chunks so we have one chunk per URL
+        while len(chunks) < n:
+            chunks.append([])
+        chunks = chunks[:n]
+
+        results_by_idx: List[Optional[List[Dict[str, Any]]]] = [None] * n
+        with ThreadPoolExecutor(max_workers=n) as executor:
+            futures = {
+                executor.submit(_request_one, _normalize_url(urls[i]), chunks[i]): i
+                for i in range(n)
+                if chunks[i]
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                results_by_idx[idx] = fut.result()
+        # Concatenate in order to preserve query order
+        out = []
+        for i in range(n):
+            if results_by_idx[i] is not None:
+                out.extend(results_by_idx[i])
+        return out
 
     # ------------------------------------------------------------------ #
     # Public interface                                                     #
@@ -330,20 +589,46 @@ class SkillsOnlyMemory(BaseMemory):
         common_mistakes = self.skills.get('common_mistakes', [])[:5]
 
         # ----------------------------------------------------------------
-        # Embedding mode: semantic ranking of all skills
+        # Embedding mode via remote service (no local model)
+        # ----------------------------------------------------------------
+        if self.retrieval_mode == "embedding" and self._retrieval_service_urls:
+            batch = self._remote_retrieve_batch([task_description], top_k=top_k, **kwargs)
+            if batch:
+                out = batch[0]
+                out.setdefault("mistakes_to_avoid", common_mistakes)
+                out.setdefault("query_text", task_description)
+                return out
+            return {
+                'query_text': task_description,
+                'general_skills': [],
+                'task_specific_skills': [],
+                'mistakes_to_avoid': common_mistakes,
+                'task_type': self._detect_task_type(task_description),
+                'task_specific_examples': [],
+                'retrieval_mode': 'embedding',
+            }
+
+        # ----------------------------------------------------------------
+        # Embedding mode: semantic ranking of all skills (in-process)
         # ----------------------------------------------------------------
         if self.retrieval_mode == "embedding":
             ts_top_k = self.task_specific_top_k if self.task_specific_top_k is not None else top_k
-            general_skills, task_skills = self._embedding_retrieve(
+            res = self._embedding_retrieve(
                 task_description=task_description,
                 top_k_general=top_k,
                 top_k_task_specific=ts_top_k,
             )
-            # Still detect task type for bookkeeping / formatting labels
+            general_skills, task_skills = res[0], res[1]
+            general_scores = res[2] if len(res) >= 4 else [None] * len(general_skills)
+            task_scores = res[3] if len(res) >= 4 else [None] * len(task_skills)
+            gs = [{**dict(s), "similarity": general_scores[j]} for j, s in enumerate(general_skills)]
+            ts = [{**dict(s), "similarity": task_scores[j]} for j, s in enumerate(task_skills)]
+            gs, ts = self._apply_similarity_threshold(gs, ts)
             task_type = self._detect_task_type(task_description)
             return {
-                'general_skills': general_skills,
-                'task_specific_skills': task_skills,
+                'query_text': task_description,
+                'general_skills': gs,
+                'task_specific_skills': ts,
                 'mistakes_to_avoid': common_mistakes,
                 'task_type': task_type,
                 'task_specific_examples': [],
@@ -360,16 +645,84 @@ class SkillsOnlyMemory(BaseMemory):
         if self.task_specific_top_k is not None:
             task_skills = all_task_skills[:self.task_specific_top_k]
         else:
-            task_skills = all_task_skills  # original behaviour: return all
-
+            task_skills = all_task_skills
+        gs = [{**dict(s), "similarity": None} for s in general_skills]
+        ts = [{**dict(s), "similarity": None} for s in task_skills]
+        gs, ts = self._apply_similarity_threshold(gs, ts)
         return {
-            'general_skills': general_skills,
-            'task_specific_skills': task_skills,
+            'query_text': task_description,
+            'general_skills': gs,
+            'task_specific_skills': ts,
             'mistakes_to_avoid': common_mistakes,
             'task_type': task_type,
             'task_specific_examples': [],
             'retrieval_mode': 'template',
         }
+
+    def retrieve_batch(
+        self,
+        task_descriptions: List[str],
+        top_k: int = 6,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve skills for multiple task descriptions in one call (batch encode
+        in embedding mode). Returns one dict per query in the same order.
+
+        Args:
+            task_descriptions: List of task goal strings.
+            top_k: Number of general skills per query (same as retrieve).
+            **kwargs: Passed through to retrieve() in template mode; ignored in embedding mode.
+
+        Returns:
+            List of dicts with same structure as :meth:`retrieve`.
+        """
+        if not task_descriptions:
+            return []
+
+        common_mistakes = self.skills.get('common_mistakes', [])[:5]
+
+        if self.retrieval_mode == "embedding" and self._retrieval_service_urls:
+            kwargs.setdefault("skill_text_for_retrieval", self._skill_text_for_retrieval)
+            batch = self._remote_retrieve_batch(task_descriptions, top_k=top_k, **kwargs)
+            for i, d in enumerate(batch):
+                d.setdefault("mistakes_to_avoid", common_mistakes)
+                d.setdefault("query_text", task_descriptions[i] if i < len(task_descriptions) else "")
+                gs, ts = self._apply_similarity_threshold(
+                    d.get("general_skills", []), d.get("task_specific_skills", [])
+                )
+                d["general_skills"] = gs
+                d["task_specific_skills"] = ts
+            return batch
+
+        if self.retrieval_mode == "embedding":
+            ts_top_k = self.task_specific_top_k if self.task_specific_top_k is not None else top_k
+            mode = kwargs.get("skill_text_for_retrieval") or self._skill_text_for_retrieval
+            batch_results = self._embedding_retrieve_batch(
+                task_descriptions=task_descriptions,
+                top_k_general=top_k,
+                top_k_task_specific=ts_top_k,
+                mode=mode,
+            )
+            out = []
+            for i, res in enumerate(batch_results):
+                gs, ts = res[0], res[1]
+                g_scores = res[2] if len(res) >= 4 else [None] * len(gs)
+                t_scores = res[3] if len(res) >= 4 else [None] * len(ts)
+                gs_with_sim = [{**dict(s), "similarity": g_scores[j]} for j, s in enumerate(gs)]
+                ts_with_sim = [{**dict(s), "similarity": t_scores[j]} for j, s in enumerate(ts)]
+                gs_with_sim, ts_with_sim = self._apply_similarity_threshold(gs_with_sim, ts_with_sim)
+                out.append({
+                    'query_text': task_descriptions[i],
+                    'general_skills': gs_with_sim,
+                    'task_specific_skills': ts_with_sim,
+                    'mistakes_to_avoid': common_mistakes,
+                    'task_type': self._detect_task_type(task_descriptions[i]),
+                    'task_specific_examples': [],
+                    'retrieval_mode': 'embedding',
+                })
+            return out
+        return [self.retrieve(q, top_k=top_k, **kwargs) for q in task_descriptions]
 
     def format_for_prompt(self, retrieved_memories: Dict[str, Any]) -> str:
         """
@@ -484,7 +837,7 @@ class SkillsOnlyMemory(BaseMemory):
 
         if added > 0:
             # Invalidate embedding cache so it is recomputed on next retrieve
-            self._skill_embeddings_cache = None
+            self._skill_embeddings_cache = {}
 
         return added
 
@@ -510,7 +863,7 @@ class SkillsOnlyMemory(BaseMemory):
                 removed = True
 
         if removed:
-            self._skill_embeddings_cache = None
+            self._skill_embeddings_cache = {}
             print(f"[SkillsOnlyMemory] Removed skill: {skill_id}")
         return removed
 

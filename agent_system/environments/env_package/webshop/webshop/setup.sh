@@ -50,8 +50,21 @@ gdown https://drive.google.com/uc?id=14Kb5SPBk_jfdLZ_CDBNitW98QLDlKR5O # items_h
 cd ..
 
 # Download spaCy large NLP model
-python -m spacy download en_core_web_lg
-python -m spacy download en_core_web_sm
+# 使用 conda 安装（推荐，支持镜像源，网络更稳定）
+echo "Installing spaCy models via conda (supports mirror sources)..."
+conda install -c conda-forge spacy-model-en_core_web_sm -y
+conda install -c conda-forge spacy-model-en_core_web_lg -y || echo "Warning: en_core_web_lg installation failed (optional, code mainly uses en_core_web_sm)"
+
+# 如果 conda 安装失败，回退到 pip 方式（需要手动配置镜像或使用代理）
+if ! python -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null; then
+    echo "Conda installation failed, trying pip with direct download..."
+    # 直接从 GitHub releases 下载 wheel 文件安装
+    pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl || \
+    python -m spacy download en_core_web_sm || echo "Error: Failed to install en_core_web_sm"
+fi
+
+# 验证必需模型安装
+python -c "import spacy; nlp = spacy.load('en_core_web_sm'); print('✓ en_core_web_sm installed successfully')" || echo "✗ en_core_web_sm installation failed - please install manually"
 
 # Build search engine index
 cd search_engine

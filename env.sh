@@ -6,7 +6,7 @@
 # RAY_DASHBOARD_CONFIG="trainer.ray_dashboard_host=0.0.0.0 trainer.ray_dashboard_port=8265"
 
 # Set RAY_DASHBOARD_CONFIG to empty if not needed
-RAY_DASHBOARD_CONFIG=""
+# RAY_DASHBOARD_CONFIG=""
 
 # SwanLab configuration
 export SWANLAB_MODE="cloud"
@@ -33,18 +33,17 @@ export SWANLAB_NON_INTERACTIVE=1
 # Threading configuration for Ray distributed training
 # 限制多线程库的线程数，避免CPU线程竞争和资源浪费
 # 这对于Ray分布式环境和sglang agent_loop非常重要，可以避免worker初始化时的线程死锁
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export TORCH_NUM_THREADS=1
-export TORCH_INTRAOP_THREADS=1
-export TORCH_INTEROP_THREADS=1
+# export OMP_NUM_THREADS=1
+# export MKL_NUM_THREADS=1
+# export OPENBLAS_NUM_THREADS=1
+# export NUMEXPR_NUM_THREADS=1
+# export TORCH_NUM_THREADS=1
+# export TORCH_INTRAOP_THREADS=1
+# export TORCH_INTEROP_THREADS=1
 
 # Ray worker startup timeout configuration
 # 增加 Ray worker 启动超时时间，解决 agent_loop worker 初始化时的注册超时问题
-# 默认是 60 秒，对于需要加载模型和 tokenizer 的 agent_loop worker 可能不够
-export RAY_worker_register_timeout_seconds=300
+export RAY_worker_register_timeout_seconds=600
 
 # Multiprocessing start method (optional, sglang will force spawn anyway)
 # export RAY_START_METHOD=spawn
@@ -52,3 +51,10 @@ export RAY_worker_register_timeout_seconds=300
 # Other environment variables can be added here
 # export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export NCCL_DEBUG=INFO
+export ALFWORLD_DATA=/data/home/zdhs0006/.cache/alfworld
+
+export OPENAI_BASE_URL="https://4zapi.com/v1"
+export OPENAI_API_KEY="sk-dNeY9OrVduTbEUxAgCocvbGARCb87jROWV70jFk3z5w7goIk"
+export OPENAI_MODEL="gemini-3-flash-preview"
+#"o3" 
+# export SUMMARIZER_OPENAI_MODEL="gemini-3-flash-preview" 

@@ -51,12 +51,29 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         # Add retrieval memory or skills-only memory if configured
         if config.env.get('use_skills_only_memory', False):
             from agent_system.memory import SkillsOnlyMemory
+            som_cfg = config.env.skills_only_memory
+            load_initial = som_cfg.get('load_initial_skills', True)
+            skills_path = som_cfg.get('skills_json_path')
+            if not skills_path or (isinstance(skills_path, str) and not skills_path.strip()):
+                load_initial = False
+                skills_path = None
+            elif not load_initial:
+                skills_path = None
             self.retrieval_memory = SkillsOnlyMemory(
-                skills_json_path=config.env.skills_only_memory.skills_json_path,
-                env="Search"
+                skills_json_path=skills_path,
+                retrieval_mode=som_cfg.get('retrieval_mode', 'template'),
+                embedding_model_path=som_cfg.get('embedding_model_path', None),
+                task_specific_top_k=som_cfg.get('task_specific_top_k', None),
+                device=som_cfg.get('device', None),
+                skill_retrieval_service_url=som_cfg.get('skill_retrieval_service_url', None),
+                skill_text_for_retrieval=som_cfg.get('skill_text_for_retrieval', 'full'),
+                load_initial_skills=load_initial,
+                similarity_threshold=som_cfg.get('similarity_threshold'),
+                skill_retrieval_timeout=som_cfg.get('skill_retrieval_timeout', 60),
             )
             self.retrieved_memories = None
-            print(f"[SearchEnvironmentManager] Skills-only memory enabled (lightweight)")
+            print(f"[SearchEnvironmentManager] Skills-only memory enabled "
+                  f"(mode={som_cfg.get('retrieval_mode', 'template')})")
         elif config.env.get('use_retrieval_memory', False):
             from agent_system.memory import RetrievalMemory
             self.retrieval_memory = RetrievalMemory(
@@ -79,23 +96,44 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self.tasks = obs
         self.memory.reset(batch_size=len(obs))
         if self.retrieval_memory is not None:
-            self.retrieved_memories = []
-
-            # Determine which config to use
             if self.config.env.get('use_skills_only_memory', False):
                 mem_config = self.config.env.skills_only_memory
+                top_k_task = mem_config.get('top_k_task', mem_config.get('top_k', 1))
+                mode = (mem_config.get('skill_gen_mode') or 'task_step').lower().strip()
+                if mode not in ("task_only", "step_only", "task_step"):
+                    mode = "task_step"
+                if mode == 'step_only' or not self.tasks:
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
+                elif hasattr(self.retrieval_memory, 'retrieve_task_skills_batch') and mode in ('task_only', 'task_step'):
+                    task_res = self.retrieval_memory.retrieve_task_skills_batch(self.tasks, top_k=top_k_task)
+                    self.retrieved_memories = [
+                        {'task_skills': r['task_skills'], 'step_skills': [], 'query_text': r.get('query_text', '')}
+                        for r in task_res
+                    ]
+                else:
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
             else:
                 mem_config = self.config.env.retrieval_memory
-
-            for task in self.tasks:
-                memories = self.retrieval_memory.retrieve(
-                    task_description=task,
-                    top_k=mem_config.get('top_k', 10),
-                    similarity_threshold=mem_config.get('similarity_threshold', 0.7),
-                    max_tokens=mem_config.get('max_tokens', 2000),
-                    include_examples=mem_config.get('include_examples', False)
-                )
-                self.retrieved_memories.append(memories)
+                top_k_task = mem_config.get('top_k', 1)
+                if hasattr(self.retrieval_memory, 'retrieve_batch') and self.tasks:
+                    self.retrieved_memories = self.retrieval_memory.retrieve_batch(
+                        self.tasks,
+                        top_k=top_k_task,
+                        similarity_threshold=mem_config.get('similarity_threshold', 0.7),
+                        max_tokens=mem_config.get('max_tokens', 2000),
+                        include_examples=mem_config.get('include_examples', False),
+                    )
+                else:
+                    self.retrieved_memories = []
+                    for task in self.tasks:
+                        memories = self.retrieval_memory.retrieve(
+                            task_description=task,
+                            top_k=top_k_task,
+                            similarity_threshold=mem_config.get('similarity_threshold', 0.7),
+                            max_tokens=mem_config.get('max_tokens', 2000),
+                            include_examples=mem_config.get('include_examples', False)
+                        )
+                        self.retrieved_memories.append(memories)
 
         observations = {
             "text": self.build_text_obs(obs, init=True),
@@ -112,6 +150,35 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "search": actions,
             "information": next_obs,
         })
+
+        # Per-step retrieval by skill_gen_mode (step_only or task_step re-retrieve at step)
+        if (self.retrieval_memory is not None and self.config.env.get('use_skills_only_memory', False)):
+            mem_config = self.config.env.skills_only_memory
+            top_k_task = mem_config.get('top_k_task', mem_config.get('top_k', 1))
+            top_k_step = mem_config.get('top_k_step', mem_config.get('top_k', 1))
+            mode = (mem_config.get('skill_gen_mode') or 'task_step').lower().strip()
+            if mode not in ("task_only", "step_only", "task_step"):
+                mode = "task_step"
+            if next_obs and self.tasks:
+                queries = [f"{self.tasks[i]}\n\nCurrent observation: {next_obs[i]}" for i in range(len(next_obs))]
+                if mode == 'task_only':
+                    if self.retrieved_memories is None or len(self.retrieved_memories) != len(self.tasks):
+                        self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': self.tasks[i] if i < len(self.tasks) else ''} for i in range(len(self.tasks))]
+                    else:
+                        for i in range(len(self.tasks)):
+                            self.retrieved_memories[i]['query_text'] = self.tasks[i] if i < len(self.tasks) else ''
+                elif mode == 'step_only' and hasattr(self.retrieval_memory, 'retrieve_step_skills_batch'):
+                    step_res = self.retrieval_memory.retrieve_step_skills_batch(queries, top_k=top_k_step)
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': r['step_skills'], 'query_text': r.get('query_text', '')} for r in step_res]
+                elif mode == 'task_step' and hasattr(self.retrieval_memory, 'retrieve_step_skills_batch'):
+                    step_res = self.retrieval_memory.retrieve_step_skills_batch(queries, top_k=top_k_step)
+                    prev = self.retrieved_memories if self.retrieved_memories is not None and len(self.retrieved_memories) == len(self.tasks) else None
+                    self.retrieved_memories = [
+                        {'task_skills': (prev[i]['task_skills'] if prev else []), 'step_skills': step_res[i]['step_skills'], 'query_text': step_res[i].get('query_text', queries[i])}
+                        for i in range(len(self.tasks))
+                    ]
+                else:
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
 
         next_observations = {
             "text": self.build_text_obs(next_obs),
@@ -194,11 +261,24 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         if config.env.get('use_skills_only_memory', False):
             from agent_system.memory import SkillsOnlyMemory
             som_cfg = config.env.skills_only_memory
+            load_initial = som_cfg.get('load_initial_skills', True)
+            skills_path = som_cfg.get('skills_json_path')
+            if not skills_path or (isinstance(skills_path, str) and not skills_path.strip()):
+                load_initial = False
+                skills_path = None
+            elif not load_initial:
+                skills_path = None
             self.retrieval_memory = SkillsOnlyMemory(
-                skills_json_path=som_cfg.skills_json_path,
+                skills_json_path=skills_path,
                 retrieval_mode=som_cfg.get('retrieval_mode', 'template'),
                 embedding_model_path=som_cfg.get('embedding_model_path', None),
                 task_specific_top_k=som_cfg.get('task_specific_top_k', None),
+                device=som_cfg.get('device', None),
+                skill_retrieval_service_url=som_cfg.get('skill_retrieval_service_url', None),
+                skill_text_for_retrieval=som_cfg.get('skill_text_for_retrieval', 'full'),
+                load_initial_skills=load_initial,
+                similarity_threshold=som_cfg.get('similarity_threshold'),
+                skill_retrieval_timeout=som_cfg.get('skill_retrieval_timeout', 60),
             )
             self.retrieved_memories = None
             print(f"[AlfWorldEnvironmentManager] Skills-only memory enabled "
@@ -227,25 +307,48 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.pre_text_obs = text_obs
         self.extract_task(text_obs)
 
-        # Retrieve memories for each task if enabled
+        batch_size = len(text_obs)
         if self.retrieval_memory is not None:
-            self.retrieved_memories = []
-
-            # Determine which config to use
             if self.config.env.get('use_skills_only_memory', False):
                 mem_config = self.config.env.skills_only_memory
+                top_k_task = mem_config.get('top_k_task', mem_config.get('top_k', 1))
+                mode = (mem_config.get('skill_gen_mode') or 'task_step').lower().strip()
+                if mode not in ("task_only", "step_only", "task_step"):
+                    mode = "task_step"
+                if mode == 'step_only':
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in range(batch_size)]
+                elif hasattr(self.retrieval_memory, 'retrieve_task_skills_batch') and self.tasks and mode in ('task_only', 'task_step'):
+                    task_res = self.retrieval_memory.retrieve_task_skills_batch(self.tasks, top_k=top_k_task)
+                    self.retrieved_memories = [
+                        {'task_skills': r['task_skills'], 'step_skills': [], 'query_text': r.get('query_text', self.tasks[i] if i < len(self.tasks) else '')}
+                        for i, r in enumerate(task_res)
+                    ]
+                else:
+                    if not self.tasks and batch_size > 0:
+                        import sys
+                        print(f"[AlfWorldEnv] Skipping retrieval: tasks empty (batch_size={batch_size}). Check extract_task / obs format.", file=sys.stderr, flush=True)
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in range(batch_size)]
             else:
                 mem_config = self.config.env.retrieval_memory
-
-            for task in self.tasks:
-                memories = self.retrieval_memory.retrieve(
-                    task_description=task,
-                    top_k=mem_config.get('top_k', 10),
-                    similarity_threshold=mem_config.get('similarity_threshold', 0.7),
-                    max_tokens=mem_config.get('max_tokens', 2000),
-                    include_examples=mem_config.get('include_examples', False)
-                )
-                self.retrieved_memories.append(memories)
+                if hasattr(self.retrieval_memory, 'retrieve_batch') and self.tasks:
+                    self.retrieved_memories = self.retrieval_memory.retrieve_batch(
+                        self.tasks,
+                        top_k=mem_config.get('top_k', 1),
+                        similarity_threshold=mem_config.get('similarity_threshold', 0.7),
+                        max_tokens=mem_config.get('max_tokens', 2000),
+                        include_examples=mem_config.get('include_examples', False),
+                    )
+                else:
+                    self.retrieved_memories = [
+                        self.retrieval_memory.retrieve(
+                            task_description=task,
+                            top_k=mem_config.get('top_k', 1),
+                            similarity_threshold=mem_config.get('similarity_threshold', 0.7),
+                            max_tokens=mem_config.get('max_tokens', 2000),
+                            include_examples=mem_config.get('include_examples', False)
+                        )
+                        for task in self.tasks
+                    ]
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
@@ -256,6 +359,49 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
 
+        query_texts = None
+        if text_obs and self.tasks:
+            query_texts = [
+                f"{self.tasks[i]}\n\nCurrent observation: {text_obs[i]}"
+                for i in range(len(text_obs))
+            ]
+        if (self.retrieval_memory is not None and self.config.env.get('use_skills_only_memory', False)):
+            mem_config = self.config.env.skills_only_memory
+            top_k_step = mem_config.get('top_k_step', mem_config.get('top_k', 1))
+            mode = (mem_config.get('skill_gen_mode') or 'task_step').lower().strip()
+            if mode not in ("task_only", "step_only", "task_step"):
+                mode = "task_step"
+            if self.tasks and query_texts:
+                if mode == 'task_only':
+                    # task_skills unchanged within episode: keep from reset, no re-retrieve
+                    if self.retrieved_memories is None or len(self.retrieved_memories) != len(self.tasks):
+                        self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': self.tasks[i] if i < len(self.tasks) else ''} for i in range(len(self.tasks))]
+                    else:
+                        for i in range(len(self.tasks)):
+                            self.retrieved_memories[i]['query_text'] = self.tasks[i] if i < len(self.tasks) else ''
+                elif mode == 'step_only' and hasattr(self.retrieval_memory, 'retrieve_step_skills_batch'):
+                    step_res = self.retrieval_memory.retrieve_step_skills_batch(query_texts, top_k=top_k_step)
+                    self.retrieved_memories = [
+                        {'task_skills': [], 'step_skills': r['step_skills'], 'query_text': r.get('query_text', '')}
+                        for r in step_res
+                    ]
+                elif mode == 'task_step' and hasattr(self.retrieval_memory, 'retrieve_step_skills_batch'):
+                    # task_skills unchanged within episode: reuse from reset; only retrieve step_skills by current step content vs cached embeddings
+                    step_res = self.retrieval_memory.retrieve_step_skills_batch(query_texts, top_k=top_k_step)
+                    prev = self.retrieved_memories if self.retrieved_memories is not None and len(self.retrieved_memories) == len(self.tasks) else None
+                    self.retrieved_memories = [
+                        {
+                            'task_skills': prev[i]['task_skills'] if prev else [],
+                            'step_skills': step_res[i]['step_skills'],
+                            'query_text': step_res[i].get('query_text', query_texts[i]),
+                        }
+                        for i in range(len(self.tasks))
+                    ]
+                else:
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
+        if query_texts is None and text_obs and self.tasks:
+            query_texts = [f"{self.tasks[i]}\n\nCurrent observation: {text_obs[i]}" for i in range(len(text_obs))]
+
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
@@ -265,20 +411,18 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             info['is_action_valid'] = to_numpy(valids[i])
 
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
+        if query_texts is not None:
+            next_observations['query_text'] = query_texts
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
     
     def extract_task(self, text_obs: List[str]):
+        """Unified short-task extraction so retrieval query matches retrieval_obs format."""
+        from agent_system.memory.task_extraction import extract_short_task_for_retrieval
         for obs in text_obs:
-            task_start = obs.find('Your task is to: ')
-            
-            if task_start != -1:
-                self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
-            else:
-                raise ValueError("Task description not found in text observation.")
-        
+            self.tasks.append(extract_short_task_for_retrieval(obs))
 
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
@@ -296,22 +440,31 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
             # Use retrieval memory template if enabled
-            use_retrieval = (self.retrieval_memory is not None and
-                           self.retrieved_memories is not None and
-                           not init)
+            use_retrieval = (self.retrieval_memory is not None and self.retrieved_memories is not None)
+            task_description = self.tasks[i]
 
             if init or self.config.env.history_length <= 0:
-                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
-                    current_observation=text_obs[i],
-                    admissible_actions=reformatted_admissible_actions
-                )
+                if use_retrieval and i < len(self.retrieved_memories):
+                    memory_context = self.retrieval_memory.format_for_prompt(self.retrieved_memories[i])
+                    obs = ALFWORLD_TEMPLATE_WITH_MEMORY.format(
+                        task_description=task_description,
+                        retrieved_memories=memory_context,
+                        step_count=0,
+                        history_length=0,
+                        action_history="",
+                        current_step=1,
+                        current_observation=text_obs[i],
+                        admissible_actions=reformatted_admissible_actions
+                    )
+                else:
+                    obs = ALFWORLD_TEMPLATE_NO_HIS.format(
+                        current_observation=text_obs[i],
+                        admissible_actions=reformatted_admissible_actions
+                    )
             elif use_retrieval:
-                # Format retrieved memories for prompt
-                memory_context = self.retrieval_memory.format_for_prompt(
-                    self.retrieved_memories[i]
-                )
+                memory_context = self.retrieval_memory.format_for_prompt(self.retrieved_memories[i])
                 obs = ALFWORLD_TEMPLATE_WITH_MEMORY.format(
-                    task_description=self.tasks[i],
+                    task_description=task_description,
                     retrieved_memories=memory_context,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
@@ -322,7 +475,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 )
             else:
                 obs = ALFWORLD_TEMPLATE.format(
-                    task_description=self.tasks[i],
+                    task_description=task_description,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
@@ -539,11 +692,24 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         if config.env.get('use_skills_only_memory', False):
             from agent_system.memory import SkillsOnlyMemory
             som_cfg = config.env.skills_only_memory
+            load_initial = som_cfg.get('load_initial_skills', True)
+            skills_path = som_cfg.get('skills_json_path')
+            if not skills_path or (isinstance(skills_path, str) and not skills_path.strip()):
+                load_initial = False
+                skills_path = None
+            elif not load_initial:
+                skills_path = None
             self.retrieval_memory = SkillsOnlyMemory(
-                skills_json_path=som_cfg.skills_json_path,
+                skills_json_path=skills_path,
                 retrieval_mode=som_cfg.get('retrieval_mode', 'template'),
                 embedding_model_path=som_cfg.get('embedding_model_path', None),
                 task_specific_top_k=som_cfg.get('task_specific_top_k', None),
+                device=som_cfg.get('device', None),
+                skill_retrieval_service_url=som_cfg.get('skill_retrieval_service_url', None),
+                skill_text_for_retrieval=som_cfg.get('skill_text_for_retrieval', 'full'),
+                load_initial_skills=load_initial,
+                similarity_threshold=som_cfg.get('similarity_threshold'),
+                skill_retrieval_timeout=som_cfg.get('skill_retrieval_timeout', 60),
             )
             self.retrieved_memories = None
             print(f"[WebshopEnvironmentManager] Skills-only memory enabled "
@@ -554,24 +720,32 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         super().__init__(envs, projection_f, config)
 
     def reset(self, kwargs) -> Dict[str, Any]:
-        obs, infos = self.envs.reset()
-        self.tasks = self.extract_task(obs)
-        obs = self.format_obs(obs)
+        obs_raw, infos = self.envs.reset()
+        self.tasks = self.extract_task(obs_raw)
+        obs = self.format_obs(obs_raw)
 
-        # Retrieve skills for each task if memory is configured
+        # Retrieve by skill_gen_mode: task_only=task_skills only, step_only=empty at init, task_step=task_skills at init
         if self.retrieval_memory is not None:
             mem_cfg = self.config.env.skills_only_memory
-            self.retrieved_memories = [
-                self.retrieval_memory.retrieve(
-                    task_description=task,
-                    top_k=mem_cfg.get('top_k', 6),
-                )
-                for task in self.tasks
-            ]
+            top_k_task = mem_cfg.get('top_k_task', mem_cfg.get('top_k', 1))
+            mode = (mem_cfg.get('skill_gen_mode') or 'task_step').lower().strip()
+            if mode not in ("task_only", "step_only", "task_step"):
+                mode = "task_step"
+            if mode == 'step_only':
+                self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
+            elif hasattr(self.retrieval_memory, 'retrieve_task_skills_batch') and self.tasks and mode in ('task_only', 'task_step'):
+                task_res = self.retrieval_memory.retrieve_task_skills_batch(self.tasks, top_k=top_k_task)
+                self.retrieved_memories = [
+                    {'task_skills': r['task_skills'], 'step_skills': [], 'query_text': r.get('query_text', '')}
+                    for r in task_res
+                ]
+            else:
+                self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
 
+        # anchor uses raw env obs for query_text / refined_trajectory / retrieval_obs
         observations = {'text': self.build_text_obs(obs, infos, init=True),
                         'image': None,
-                        'anchor': obs.copy()
+                        'anchor': obs_raw.copy()
                         }
         self.pre_text_obs = obs
         self.memory.reset(batch_size=len(infos))
@@ -579,19 +753,61 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
 
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
-        next_obs, rewards, dones, infos = self.envs.step(actions)
-
-        next_obs = self.format_obs(next_obs)
+        next_obs_raw, rewards, dones, infos = self.envs.step(actions)
+        next_obs = self.format_obs(next_obs_raw)
 
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = next_obs
 
+        # query_text and anchor use raw env obs (same as AlfWorld) for retrieval/skill consistency
+        if next_obs_raw and self.tasks:
+            query_texts = [
+                f"{self.tasks[i]}\n\nCurrent observation: {next_obs_raw[i]}"
+                for i in range(len(next_obs_raw))
+            ]
+        else:
+            query_texts = None
+        if self.retrieval_memory is not None and self.config.env.get('use_skills_only_memory', False):
+            mem_config = self.config.env.skills_only_memory
+            top_k_task = mem_config.get('top_k_task', mem_config.get('top_k', 1))
+            top_k_step = mem_config.get('top_k_step', mem_config.get('top_k', 1))
+            mode = (mem_config.get('skill_gen_mode') or 'task_step').lower().strip()
+            if mode not in ("task_only", "step_only", "task_step"):
+                mode = "task_step"
+            if self.tasks and query_texts:
+                if mode == 'task_only':
+                    if self.retrieved_memories is None or len(self.retrieved_memories) != len(self.tasks):
+                        self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': self.tasks[i] if i < len(self.tasks) else ''} for i in range(len(self.tasks))]
+                    else:
+                        for i in range(len(self.tasks)):
+                            self.retrieved_memories[i]['query_text'] = self.tasks[i] if i < len(self.tasks) else ''
+                elif mode == 'step_only' and hasattr(self.retrieval_memory, 'retrieve_step_skills_batch'):
+                    step_res = self.retrieval_memory.retrieve_step_skills_batch(query_texts, top_k=top_k_step)
+                    self.retrieved_memories = [
+                        {'task_skills': [], 'step_skills': r['step_skills'], 'query_text': r.get('query_text', '')}
+                        for r in step_res
+                    ]
+                elif mode == 'task_step' and hasattr(self.retrieval_memory, 'retrieve_step_skills_batch'):
+                    step_res = self.retrieval_memory.retrieve_step_skills_batch(query_texts, top_k=top_k_step)
+                    prev = self.retrieved_memories if self.retrieved_memories is not None and len(self.retrieved_memories) == len(self.tasks) else None
+                    self.retrieved_memories = [
+                        {
+                            'task_skills': prev[i]['task_skills'] if prev else [],
+                            'step_skills': step_res[i]['step_skills'],
+                            'query_text': step_res[i].get('query_text', query_texts[i]),
+                        }
+                        for i in range(len(self.tasks))
+                    ]
+                else:
+                    self.retrieved_memories = [{'task_skills': [], 'step_skills': [], 'query_text': ''} for _ in self.tasks]
+
         next_observations = {
             'text': self.build_text_obs(next_obs, infos),
             'image': None,
-            'anchor': next_obs.copy()
+            'anchor': next_obs_raw.copy()
         }
-        # add action_valid to infos
+        if query_texts is not None:
+            next_observations['query_text'] = query_texts
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
@@ -601,13 +817,10 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         return next_observations, rewards, dones, infos
 
     def extract_task(self, text_obs: List[str]):
-        tasks = []
-        for obs in text_obs:
-            parts = obs.split(" [SEP] ")
-            assert parts[1]=='Instruction:'
-            tasks.append(parts[2])
-        return tasks
-    
+        """Unified short-task extraction so retrieval query matches retrieval_obs format."""
+        from agent_system.memory.task_extraction import extract_short_task_for_retrieval
+        return [extract_short_task_for_retrieval(obs) for obs in text_obs]
+
     def format_obs(self, text_obs):
         postprocess_text_obs = []
         for i in range(len(text_obs)):
@@ -652,26 +865,35 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         use_retrieval = (
             self.retrieval_memory is not None
             and self.retrieved_memories is not None
-            and not init
         )
-
         for i in range(len(text_obs)):
-
             available_actions = self.format_avail_actions(infos[i]['available_actions'])
             reformatted_available_actions = "\n".join(f"'{s}'," for s in available_actions)
+            task_description = self.tasks[i]
 
             if init or self.config.env.history_length <= 0:
-                obs = WEBSHOP_TEMPLATE_NO_HIS.format(
-                    task_description=self.tasks[i],
-                    current_observation=text_obs[i],
-                    available_actions=reformatted_available_actions
-                )
+                if use_retrieval and i < len(self.retrieved_memories):
+                    memory_context = self.retrieval_memory.format_for_prompt(self.retrieved_memories[i])
+                    obs = WEBSHOP_TEMPLATE_WITH_MEMORY.format(
+                        task_description=task_description,
+                        retrieved_memories=memory_context,
+                        step_count=0,
+                        history_length=0,
+                        action_history="",
+                        current_step=1,
+                        current_observation=text_obs[i],
+                        available_actions=reformatted_available_actions
+                    )
+                else:
+                    obs = WEBSHOP_TEMPLATE_NO_HIS.format(
+                        task_description=task_description,
+                        current_observation=text_obs[i],
+                        available_actions=reformatted_available_actions
+                    )
             elif use_retrieval:
-                memory_context = self.retrieval_memory.format_for_prompt(
-                    self.retrieved_memories[i]
-                )
+                memory_context = self.retrieval_memory.format_for_prompt(self.retrieved_memories[i])
                 obs = WEBSHOP_TEMPLATE_WITH_MEMORY.format(
-                    task_description=self.tasks[i],
+                    task_description=task_description,
                     retrieved_memories=memory_context,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
@@ -682,7 +904,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 )
             else:
                 obs = WEBSHOP_TEMPLATE.format(
-                    task_description=self.tasks[i],
+                    task_description=task_description,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
@@ -693,7 +915,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             if len(obs) > 13000:
                 print(f"Warning len(obs)={len(obs)} is too long")
                 obs = WEBSHOP_TEMPLATE_NO_HIS.format(
-                    task_description=self.tasks[i],
+                    task_description=task_description,
                     current_observation=text_obs[i],
                     available_actions=reformatted_available_actions
                 )
@@ -860,6 +1082,8 @@ def make_envs(config):
         return envs, val_envs
     elif "webshop" in config.env.env_name.lower():
         from agent_system.environments.env_package.webshop import build_webshop_envs, webshop_projection
+        print("[WebShop] Initializing WebShop envs (each worker loads products + Lucene index). "
+              "Small dataset (~1k products): ~30s–2min per worker; full dataset: longer. Look for 'Products loaded.' / 'Loaded N goals.'")
         if config.env.webshop.use_small:
             file_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_shuffle_1000.json')
             attr_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_ins_v2_1000.json')
@@ -880,7 +1104,10 @@ def make_envs(config):
         envs = WebshopEnvironmentManager(_envs, projection_f, config)
         val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
         import time
-        time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready
+        wait_sec = (config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1
+        print(f"[WebShop] Waiting {wait_sec:.1f}s for all workers to finish init...")
+        time.sleep(wait_sec)
+        print("[WebShop] Envs ready.")
         return envs, val_envs
     elif "appworld" in config.env.env_name.lower():
         from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection

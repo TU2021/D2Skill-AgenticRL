@@ -22,14 +22,16 @@ from collections import defaultdict
 
 import numpy as np
 
+# Optional: only required when using local embedding (RetrievalMemory with local index).
+# Origin mode and API-based retrieval (e.g. skill_retrieval_service_url) do not need these.
 try:
     from sentence_transformers import SentenceTransformer
     import faiss
+    _HAS_EMBEDDING_DEPS = True
 except ImportError:
-    raise ImportError(
-        "sentence-transformers and faiss-cpu are required for retrieval memory. "
-        "Install with: pip install sentence-transformers faiss-cpu"
-    )
+    SentenceTransformer = None
+    faiss = None
+    _HAS_EMBEDDING_DEPS = False
 
 from .base import BaseMemory
 
@@ -125,6 +127,12 @@ class RetrievalMemory(BaseMemory):
         """Lazy initialization of embedding model and indices."""
         if self._initialized:
             return
+        if not _HAS_EMBEDDING_DEPS:
+            raise ImportError(
+                "sentence-transformers and faiss-cpu are required for local retrieval memory. "
+                "Install with: pip install sentence-transformers faiss-cpu. "
+                "Or use API-based retrieval (skill_retrieval_service_url) which does not need them."
+            )
 
         import torch
 

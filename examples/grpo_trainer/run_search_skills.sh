@@ -2,16 +2,21 @@ set -x
 
 ENGINE=${1:-vllm}
 
-# export WANDB_API_KEY=""
-# export MODEL_PATH=""
-export WANDB_NAME="search_grpo_qwen2.5_7b_skills"
+PROJECT_DIR="$(pwd)"
+source ${0%/*}/../../env.sh
 
 train_data_size=256
 val_data_size=512
 group_size=4
 
-TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
-VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
+# TRAIN_DATA="/data/home/zdhs0006/data/searchR1_processed_direct/train.parquet"
+# VAL_DATA="/data/home/zdhs0006/data/searchR1_processed_direct/test.parquet"
+
+TRAIN_DATA="/data/home/zdhs0006/data_verl_agent/search/test_512.parquet"
+VAL_DATA="/data/home/zdhs0006/data_verl_agent/search/test_512.parquet"
+
+# export WANDB_API_KEY=""
+ACTOR_MODEL_PATH="/data/home/zdhs0006/SkillRL/models/Search-7B-SFT"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -21,10 +26,10 @@ python3 -m verl.trainer.main_ppo \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=5000 \
     data.max_response_length=700 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.truncation='left' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=$MODEL_PATH \
+    actor_rollout_ref.model.path=$ACTOR_MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -54,7 +59,7 @@ python3 -m verl.trainer.main_ppo \
     env.max_steps=4 \
     env.rollout.n=$group_size \
     env.history_length=4 \
-    env.search.search_url='http://127.0.0.1:8030/retrieve' \
+    env.search.search_url='http://127.0.0.1:8005/retrieve' \
     +env.use_skills_only_memory=True \
     +env.skills_only_memory.skills_json_path=memory_data/search/claude_style_skills_search.json \
     +env.skills_only_memory.top_k=6 \
@@ -62,9 +67,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console','swanlab'] \
     trainer.project_name='verl_agent_search' \
     trainer.experiment_name='grpo_qwen2.5_7b_instruct' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=5 \
+    trainer.validation_data_dir="${PROJECT_DIR}/swanlog/validation_generations" \
+    trainer.log_val_generations=50 \
+    trainer.save_freq=50 \
     trainer.test_freq=200 \
-    trainer.total_epochs=0 \
-    trainer.val_before_train=True  $@
+    trainer.total_epochs=1 \
+    trainer.val_before_train=True \
+    ray_init.num_cpus=96 \
+    trainer.ray_wait_register_center_timeout=600 \
+    2>&1 | tee run_search_skills.log
