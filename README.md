@@ -7,8 +7,6 @@ Code release for our paper **Dynamic Dual-Granularity Skill Bank for Agentic RL*
   <img src="figs/main.png" width="88%" alt="D2Skill Main Figure">
 </p>
 
-The final runnable scripts are under `examples_d2skill/`.
-
 ---
 
 ## 1) Environment Setup
