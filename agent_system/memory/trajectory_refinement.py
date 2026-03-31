@@ -9,18 +9,20 @@
 # building refined_trajectory for WebShop or other envs that do not use gymnasium).
 
 """
-失败轨迹精炼（AlfWorld / WebShop 等通用）。
+Failed-trajectory refinement (shared by AlfWorld / WebShop / related envs).
 
-将冗长的原始轨迹（含 system、task、## Retrieved Relevant Experience、每步完整输入）
-提炼为「仅任务描述 + 每步环境 obs + 每步 agent action」的对话式格式。
-任务描述由统一的 extract_short_task_for_retrieval 提取（"Your task is to: " 等）。
+This module converts verbose raw trajectories (including system/task text,
+retrieved-experience blocks, and full per-step inputs) into a compact dialogue
+format: task description + per-step environment observation + per-step agent action.
+Task text is extracted by the unified extract_short_task_for_retrieval helper
+(e.g. from "Your task is to: ...").
 """
 
 from typing import List, Dict, Any
 
 
 def is_alfworld_env(env_name: str) -> bool:
-    """判断当前是否为 AlfWorld 类环境（用于决定是否调用本精炼逻辑）。"""
+    """Check whether the current environment is AlfWorld-like."""
     if env_name is None:
         return False
     return "alfworld" in env_name.lower()
@@ -28,7 +30,8 @@ def is_alfworld_env(env_name: str) -> bool:
 
 def extract_task_short(first_input: str) -> str:
     """
-    从首步完整输入中提取简短任务描述。委托给统一提取函数（AlfWorld/WebShop 均用 "Your task is to:"）。
+    Extract a short task description from the first-step full input.
+    Delegates to the shared extractor (AlfWorld/WebShop both use "Your task is to:").
     """
     from agent_system.memory.task_extraction import extract_short_task_for_retrieval
     if not first_input or not isinstance(first_input, str):
@@ -42,15 +45,17 @@ def build_refined_trajectory(
     actions: List[str],
 ) -> Dict[str, Any]:
     """
-    构建精炼轨迹：仅保留 task + 每步 (observation, action)。
+    Build a refined trajectory that keeps only task + per-step (observation, action).
 
-    Turn 索引约定：turns 为 0-based 列表，turns[0] = 第 1 步 (obs, action)，
-    与 summarizer 的 "Turn 1" / ERROR_TURN: 1 对应；使用时用 error_turn_1based - 1 下标即可。
+    Turn indexing convention: turns is a 0-based list, where turns[0] is step 1.
+    This aligns with summarizer output such as "Turn 1" / ERROR_TURN: 1, so callers
+    can map using error_turn_1based - 1.
 
     Args:
-        task_short: 简短任务描述（由 extract_task_short 得到）。
-        observations: 每步的环境观测，应与 actions 同长；通常来自 batch 的 anchor_obs。
-        actions: 每步智能体输出（含 think/action）。
+        task_short: Short task description from extract_task_short.
+        observations: Per-step environment observations; should match actions length.
+            Usually from batch anchor_obs.
+        actions: Per-step agent outputs (including think/action).
 
     Returns:
         {"task": str, "turns": [{"observation": str, "action": str}, ...]}  (turns 0-based)

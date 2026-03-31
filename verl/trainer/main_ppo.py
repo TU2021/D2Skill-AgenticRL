@@ -149,13 +149,10 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        # expert_wrong_step_penalty: 0 = off; >0 = subtract from score for steps marked expert_wrong_step (scale with success reward, e.g. 1.0~2.0 when reward=10)
-        expert_wrong_step_penalty = config.reward_model.get("expert_wrong_step_penalty", 0.0)
         reward_fn = reward_manager_cls(
             tokenizer=tokenizer,
             num_examine=0,
             normalize_by_length=False,
-            expert_wrong_step_penalty=expert_wrong_step_penalty,
         )
 
         # Note that we always use function-based RM for validation
@@ -163,7 +160,6 @@ class TaskRunner:
             tokenizer=tokenizer,
             num_examine=1,
             normalize_by_length=False,
-            expert_wrong_step_penalty=expert_wrong_step_penalty,
         )
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)

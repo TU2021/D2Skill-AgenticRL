@@ -354,9 +354,12 @@ class TrajectoryCollector:
         # Per-step retrieval for recording only: always trajectory-level (len = num_trajectories).
         # Trainer will pop this before adjust_batch so it never causes length mismatch.
         if per_step_retrieved is not None:
-            # 必须存成 shape (n_traj,) 的 object 数组，每格是一条轨迹的 list[dict]。
-            # 若直接 np.array(list_of_lists) 且各轨迹步数相同，会变成 (n_traj, L) 二维矩阵，
-            # 后续 .ravel() 会把「按轨迹」变成「按步展平」，记录 JSON 时 sample_i 只剩全局第 i 个 step。
+            # Must store as an object array with shape (n_traj,), where each cell
+            # is one trajectory-level list[dict]. If we directly call np.array on
+            # list_of_lists and all trajectories share the same step count, NumPy
+            # creates a 2D (n_traj, L) matrix. A later .ravel() would flatten by
+            # step instead of by trajectory, and JSON records would keep only the
+            # global i-th step for sample_i.
             n_ps = len(per_step_retrieved)
             _ps_store = np.empty(n_ps, dtype=object)
             for _ii in range(n_ps):
@@ -508,12 +511,6 @@ class TrajectoryCollector:
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
-            # expert_wrong_step: normally set later by trajectory-end LLM labeling (_apply_expert_wrong_step_from_llm);
-            # env may set info['expert_wrong_step'] for real-time signal; default False here, overwritten when using LLM path.
-            batch.non_tensor_batch['expert_wrong_step'] = np.array(
-                [info.get('expert_wrong_step', False) for info in infos], dtype=bool
-            )
-
             # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)
 

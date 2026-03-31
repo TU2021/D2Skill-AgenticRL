@@ -404,7 +404,8 @@ class SkillsOnlyMemory(BaseMemory):
             return {"utility": u, "ucb": 0.0, "retrieval_score": sim_norm}
         n = int(skill.get("retrieval_count", 0))
         N = sum(int(s.get("retrieval_count", 0)) for s in items)
-        # 正常 UCB：log(1+N)，当 N=0 时 log_N=0，自然得到 UCB=0，不再额外“抬高”或“强制为 0”
+        # Standard UCB: use log(1+N). When N=0, log_N=0 and UCB naturally stays 0
+        # without extra boosting or hard-forcing behavior.
         log_N = math.log(1 + N) if N > 0 else 0.0
         denom = 1 + n
         exploration_bonus = c * (math.sqrt(log_N / denom) if log_N > 0 and denom > 0 else 0.0)
@@ -805,7 +806,8 @@ class SkillsOnlyMemory(BaseMemory):
             skill.setdefault("utility", DEFAULT_UTILITY)
             skill.setdefault("retrieval_count", DEFAULT_RETRIEVAL_COUNT)
             skill.setdefault("last_retrieval_step", DEFAULT_LAST_RETRIEVAL_STEP)
-            # 调用方传入 created_at_step 时强制写入当前训练步，避免 LLM/模板里带的 0 残留
+            # When created_at_step is provided by the caller, always overwrite it
+            # with the current training step to avoid stale 0 values from LLM/templates.
             if created_at_step is not None:
                 skill["created_at_step"] = int(created_at_step)
             else:
@@ -907,7 +909,8 @@ class SkillsOnlyMemory(BaseMemory):
             excess = len(pool) - max_size
             N = sum(int(s.get("retrieval_count", 0)) for s in pool)
             log_N = math.log(1 + N) if N > 0 else 0.0
-            # 一律按下标删，避免池中重复 skill_id 时按 id 删会多删
+            # Always delete by index. Deleting by skill_id can over-delete when
+            # duplicate skill_id values exist in the pool.
             candidates: List[Tuple[float, int, Dict[str, Any]]] = []
             for idx, skill in enumerate(pool):
                 if not isinstance(skill, dict):

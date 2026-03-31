@@ -719,7 +719,8 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
-        # train / val 共用同一 retrieval_memory（含 eviction 后），避免只改 envs 而 val 仍用旧库。
+        # Train/val share the same retrieval_memory (including post-eviction state)
+        # so validation never reads an outdated bank while train has already updated it.
         som_cfg = self.config.env.get("skills_only_memory") or {}
         if self.config.env.get("use_skills_only_memory"):
             erm = getattr(self.envs, "retrieval_memory", None)
@@ -743,7 +744,8 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        # 每轮 val：对每个失败任务用 refined_trajectory/query_texts 收集，最后统一生成 skill
+        # Per validation round: collect failed trajectories with refined_trajectory/query_texts
+        # and generate skills in one consolidated update.
         all_failed_trajectories = []
 
         for test_data in self.val_dataloader:
@@ -893,7 +895,8 @@ class RayPPOTrainer:
             for uid in unique_traj_uids:
                 sample_scores.append(traj_to_score.get(uid, 0.0))
 
-            # 本 batch 内用 batch 收集失败轨迹（带 refined_trajectory / query_texts），供本轮 val 统一生成 skill
+            # Collect failed trajectories from this batch (with refined_trajectory/query_texts)
+            # for a consolidated skill update at the end of this validation round.
             n_steps = len(traj_uids)
             input_per_step = []
             for i in range(n_steps):
@@ -972,9 +975,9 @@ class RayPPOTrainer:
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
 
-        # === Skill Bank 动态更新（验证侧）：写入 val + train 的 retrieval_memory。
-        # 若 update_source 为 train 或 all，训练循环里每步还会 _update_skills_from_training_data 再写 train；
-        # 两套入口会对相似失败各跑一次 LLM，易产出内容相同的 skill；add_skills 已按内容去重，避免 task_090 / task_100 双份。
+        # Dynamic Skill Bank Update (validation side): write to both val/train retrieval_memory.
+        # If update_source is train/all, the train loop also runs _update_skills_from_training_data;
+        # similar failures may be summarized twice, but add_skills deduplicates by content.
         if self.config.env.get('skills_only_memory', {}).get('enable_dynamic_update', False):
             update_source = self.config.env.get('skills_only_memory', {}).get('update_source', 'validation')
             if update_source in ['validation', 'all'] and all_failed_trajectories:
@@ -986,15 +989,17 @@ class RayPPOTrainer:
                     failed_trajectories=all_failed_trajectories,
                 )
 
-        # Skill bank eviction：与 test_freq 对齐（仅在本轮跑了 validation 时执行）；单一真源 = envs.retrieval_memory
+        # Skill bank eviction aligned with test_freq (runs only when validation executes);
+        # single source of truth is envs.retrieval_memory.
         self._run_skill_eviction_after_validation()
 
         return metric_dict
 
     def _run_skill_eviction_after_validation(self) -> None:
         """
-        在每次 validation 结束后（与 test_freq 一致）按 management 配置删减 skill 池。
-        仅修改 self.envs.retrieval_memory；val_envs 已在 _validate 开头与其对齐为同一实例。
+        Run skill-pool eviction after each validation pass (aligned with test_freq)
+        using management config. Only self.envs.retrieval_memory is mutated; val_envs
+        is already aligned to the same instance at the start of _validate.
         """
         som = self.config.env.get("skills_only_memory") or {}
         mgr = som.get("management") or {}
@@ -1081,11 +1086,13 @@ class RayPPOTrainer:
         failed_trajectories: list = None,
     ):
         """
-        根据 validation 结果更新 skill bank。
+        Update the skill bank from validation outcomes.
 
-        若传入 failed_trajectories（每轮 val 已按 batch 用 refined_trajectory/query_texts 收集），
-        则直接使用，对每个失败任务分别总结并生成 skill 后拼在一起；
-        否则沿用旧逻辑：仅当某任务类型成功率低于阈值时再收集失败轨迹并更新。
+        If failed_trajectories is provided (already collected per batch with
+        refined_trajectory/query_texts in this validation round), use it directly
+        and summarize each failed task before merging generated skills.
+        Otherwise use the fallback path: collect failures only when some task
+        success rate is below threshold.
         """
         update_config = self.config.env.skills_only_memory
 
@@ -1116,17 +1123,18 @@ class RayPPOTrainer:
             print("[SkillUpdate] No failed trajectories found")
             return
 
-        # 初始化 SkillUpdater（外部 API / Azure / 本地 OpenAI 兼容服务见 env.skills_only_memory.skill_llm_*）
+        # Initialize SkillUpdater (external API / Azure / local OpenAI-compatible service:
+        # see env.skills_only_memory.skill_llm_*).
         if not hasattr(self, 'skill_updater'):
             self.skill_updater = SkillUpdater(**skill_updater_kwargs_from_config(update_config))
 
-        # 获取当前 skills
+        # Get current skills
         retrieval_memory = self.val_envs.retrieval_memory
         if retrieval_memory is None:
             print("[SkillUpdate] No retrieval_memory found in val_envs")
             return
 
-        # 保存失败轨迹到磁盘（如果配置启用）
+        # Persist failed trajectories to disk (if enabled)
         save_traj = update_config.get('update_save_traj', False)
         save_dir = self.config.trainer.get('default_local_dir', './outputs')
         if save_traj:
@@ -1135,21 +1143,23 @@ class RayPPOTrainer:
                 import json
                 os.makedirs(save_dir, exist_ok=True)
                 
-                # 初始化 SkillUpdater（如果还没有）以便使用其格式化方法（与上面参数一致）
+                # Initialize SkillUpdater (if needed) so we can reuse its formatter
+                # with the same configuration as above.
                 if not hasattr(self, 'skill_updater'):
                     self.skill_updater = SkillUpdater(**skill_updater_kwargs_from_config(update_config))
 
-                # 格式化轨迹，使其与传给 LLM 的内容一致
+                # Format trajectories to match the exact payload sent to the LLM.
                 formatted_trajectories = []
                 for traj in failed_trajectories:
-                    # 只保存 task / task_type / refined_trajectory 等，不再存 original_trajectory、llm_prompt_section
+                    # Save only task / task_type / refined_trajectory, etc.
+                    # Skip original_trajectory and llm_prompt_section.
                     formatted_traj = {
                         'task': traj['task'],
                         'task_type': traj['task_type'],
                         'full_dialogue': traj.get('full_dialogue', False),
                     }
                     if 'refined_trajectory' in traj:
-                        formatted_traj['refined_trajectory'] = traj['refined_trajectory']  # AlfWorld 精炼格式
+                        formatted_traj['refined_trajectory'] = traj['refined_trajectory']  # AlfWorld refined format
                     formatted_trajectories.append(formatted_traj)
                 
                 with open(failed_traj_path, 'w', encoding='utf-8') as f:
@@ -1160,7 +1170,7 @@ class RayPPOTrainer:
                 import traceback
                 traceback.print_exc()
 
-        # 分析失败并生成新 skills
+        # Analyze failures and generate new skills
         print(
             f"[SkillUpdate] Analyzing {len(failed_trajectories)} failed trajectories "
             f"(model={self.skill_updater.model}, backend={self.skill_updater.api_type})..."
@@ -1193,7 +1203,7 @@ class RayPPOTrainer:
             print(f"[SkillUpdate] Warning: Failed to save LLM call info: {e}")
         if save_traj:
             try:
-                # 把输入给 summarizer 的 query 与 error_turn 写回 failed_trajectories JSON
+                # Write summarizer query + error_turn back to failed_trajectories JSON.
                 summarizer_queries = llm_metadata.get('summarizer_queries', [])
                 error_turns = llm_metadata.get('error_turns', [])
                 if summarizer_queries or error_turns:
@@ -1207,7 +1217,7 @@ class RayPPOTrainer:
                             if key in traj:
                                 ft[key] = traj[key]
                         ft['summarizer_query'] = summarizer_queries[i] if i < len(summarizer_queries) else None
-                        # ERROR_TURN: N 供存记忆使用（与 expert_wrong_step_penalty 无关）
+                        # ERROR_TURN: N (used for memory persistence)
                         ft['error_turn'] = error_turns[i] if i < len(error_turns) else None
                         formatted_with_queries.append(ft)
                     with open(failed_traj_path, 'w', encoding='utf-8') as f:
@@ -1267,85 +1277,6 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"[SkillUpdate] Warning: Failed to sync skills to server: {e}")
 
-    def _apply_expert_wrong_step_from_llm(self, batch: DataProto) -> None:
-        """
-        Label expert_wrong_step by: after trajectory ends, use failed trajectories + one summarizer
-        call (with ERROR_TURN in prompt) to get which step went wrong, then write back to
-        batch.non_tensor_batch['expert_wrong_step']. Only requires expert_wrong_step_penalty > 0.
-        Works regardless of retrieval_obs or use_skills_only_memory: we always use retrieval_obs=True
-        for this call so the summarizer returns ERROR_TURN. Summarizer config from
-        env.skills_only_memory, fallback to reward_model.expert_wrong_step_summarizer_model when
-        skills_only_memory is disabled.
-        """
-        penalty = self.config.reward_model.get("expert_wrong_step_penalty", 0.0)
-        if penalty <= 0:
-            return
-        som_cfg = self.config.env.get("skills_only_memory", {}) or {}
-        inp = batch.batch["input_ids"] if "input_ids" in batch.batch else batch.batch.get("prompts")
-        if inp is None or "traj_uid" not in batch.non_tensor_batch:
-            return
-        n = inp.shape[0] if hasattr(inp, "shape") else len(inp)
-        if n == 0:
-            return
-        traj_uid_arr = batch.non_tensor_batch["traj_uid"]
-        # Decode batch for _collect_failed_trajectories (same as later train path)
-        try:
-            _inputs = [
-                self.tokenizer.decode(inp[i], skip_special_tokens=True)
-                for i in range(n)
-            ]
-            _outputs = [
-                self.tokenizer.decode(batch.batch["responses"][i], skip_special_tokens=True)
-                for i in range(n)
-            ]
-        except Exception as e:
-            print(f"[ExpertWrongStep] Decode failed: {e}")
-            return
-        scores_arr = batch.non_tensor_batch.get("episode_rewards")
-        if scores_arr is None:
-            return
-        failed_list = self._collect_failed_trajectories(_inputs, _outputs, scores_arr, batch=batch)
-        if not failed_list:
-            batch.non_tensor_batch["expert_wrong_step"] = np.zeros(n, dtype=bool)
-            return
-        # Summarizer config: prefer skills_only_memory, fallback to reward_model when use_skills_only_memory=False
-        rm_cfg = self.config.reward_model or {}
-        summarizer_model = som_cfg.get("summarizer_model") or rm_cfg.get("expert_wrong_step_summarizer_model") or rm_cfg.get("summarizer_model")
-        if not summarizer_model:
-            print("[ExpertWrongStep] No summarizer_model (skills_only_memory or reward_model.expert_wrong_step_summarizer_model); skipping LLM labeling")
-            batch.non_tensor_batch["expert_wrong_step"] = np.zeros(n, dtype=bool)
-            return
-        # Use a dedicated SkillUpdater with retrieval_obs=True so summarizer returns ERROR_TURN (do not overwrite self.skill_updater)
-        summarizer_for_penalty = SkillUpdater(
-            **skill_updater_kwargs_from_config(som_cfg),
-            summarizer_model=summarizer_model,
-        )
-        error_turns = summarizer_for_penalty.get_error_turns_for_failed_trajectories(failed_list)
-        traj_uid_to_error_turn = {}
-        for item, et in zip(failed_list, error_turns):
-            tid = item.get("traj_uid")
-            if tid is not None and et is not None and et >= 1:
-                traj_uid_to_error_turn[tid] = et
-        # step_1based[i] = 1-based step index of row i within its trajectory (same as "Turn N" in dialogue)
-        step_1based = np.zeros(n, dtype=np.int32)
-        traj_counter = {}
-        for i in range(n):
-            uid = traj_uid_arr[i]
-            traj_counter[uid] = traj_counter.get(uid, 0) + 1
-            step_1based[i] = traj_counter[uid]
-        # Match: error_turn from LLM is 1-based; step_1based is 1-based -> direct equality
-        expert_wrong_step = np.array([
-            traj_uid_to_error_turn.get(traj_uid_arr[i], -1) == step_1based[i]
-            for i in range(n)
-        ], dtype=bool)
-        batch.non_tensor_batch["expert_wrong_step"] = expert_wrong_step
-        num_marked = int(expert_wrong_step.sum())
-        if num_marked > 0:
-            print(f"[ExpertWrongStep] Labeled {num_marked} step(s) as wrong from {len(failed_list)} failed trajs (LLM ERROR_TURN)")
-        elif failed_list:
-            # 兜底：有失败轨迹但 LLM 未返回有效 ERROR_TURN（或返回 0/unclear）时，不施加 step 惩罚
-            print(f"[ExpertWrongStep] Fallback: {len(failed_list)} failed trajs but no valid ERROR_TURN from summarizer -> no step penalty applied")
-
     @staticmethod
     def _json_safe_for_retrieved_skills(obj):
         """Recursively convert numpy / non-JSON types so json.dump never fails mid-stream."""
@@ -1376,7 +1307,9 @@ class RayPPOTrainer:
         if per_step_data is None or n_envs <= 0:
             return None
         arr = np.asarray(per_step_data, dtype=object)
-        # 若曾被存成 (n_traj, n_steps) 的二维 object（各轨迹等长时 np.array 会如此），先压回每轨迹一条 list
+        # If this was previously stored as a 2D object array (n_traj, n_steps)
+        # (which happens when all trajectories have equal step count), collapse it
+        # back to one list per trajectory.
         if arr.ndim == 2 and arr.size > 0:
             _rows, _cols = arr.shape[0], arr.shape[1]
             _flat = np.empty(_rows, dtype=object)
@@ -1526,7 +1459,7 @@ class RayPPOTrainer:
     def _update_skill_utilities_from_rollout(self, batch) -> None:
         """
         Update skill utilities (EMA) from this rollout. Per-task:
-        - task_utility_g = (加经验一半平均成功率) - (不加入记忆一半平均成功率); can be negative.
+        - task_utility_g = avg_success(with-skills half) - avg_success(baseline half); can be negative.
           Used to update **task_skills** retrieved in task g (once per task).
         - step_skill credit_i = success_i - success_baseline_g (trajectory i in task g); can be negative.
           Reflects step-level advantage over the task's baseline; used to update **step_skills**.
@@ -1623,7 +1556,8 @@ class RayPPOTrainer:
                 )
                 total_updated += n
             for i in with_skills_idx:
-                # step_skill credit = success_i - success_baseline_所在任务，体现相对本任务 baseline 的优势（可为负）
+                # step_skill credit = success_i - success_baseline_of_same_task,
+                # representing relative advantage over that task baseline (can be negative).
                 credit_i = float(success_per_traj[i]) - success_baseline_g if use_baseline_for_credit else float(success_per_traj[i])
                 step_skill_ids_i = set()
                 for step_snap in (per_step[i] if i < len(per_step) else []):
@@ -1720,11 +1654,14 @@ class RayPPOTrainer:
         with_skills_mask=None,
     ) -> list:
         """
-        收集失败的 trajectories 用于分析。
+        Collect failed trajectories for analysis.
 
-        若提供 batch，则按 traj_uid 重建完整轨迹历史（含 observations），与验证逻辑一致。
-        若 enable_dynamic_management 且 baseline_ab_split 且传入 with_skills_mask，则只保留
-        「加入经验」的失败轨迹（with_skills_mask=True）用于反思/获取 skills；成功轨迹不受限。
+        If batch is provided, reconstruct full trajectory history (including observations)
+        by traj_uid, consistent with validation logic.
+        If enable_dynamic_management and baseline_ab_split are enabled and with_skills_mask
+        is provided, only keep failed trajectories from the with-skills half
+        (with_skills_mask=True) for reflection/skill update; successful trajectories
+        are not restricted.
         """
         failed = []
         
@@ -1800,7 +1737,8 @@ class RayPPOTrainer:
                 traj_dict[traj_uid]['indices'].append(idx)
             
             print(f"[CollectFailedTraj] Grouped into {len(traj_dict)} unique trajectories")
-            # Per-traj with_skills (加入经验): when baseline_ab_split, only use failed trajs with with_skills=True for reflection/skill update
+            # Per-trajectory with_skills flag: under baseline_ab_split, only failed
+            # trajectories with with_skills=True are used for reflection/skill update.
             traj_uid_to_with_skills = {}
             if with_skills_mask is not None:
                 wsm = np.asarray(with_skills_mask).ravel()
@@ -1865,7 +1803,8 @@ class RayPPOTrainer:
                     tid for tid, tdata in traj_dict.items()
                     if any(s <= 0 for s in tdata['scores'])
                 ]
-            # When enable_dynamic_management and baseline_ab_split: only use failed trajs that are 加入经验 (with_skills=True) for reflection/skill update
+            # When enable_dynamic_management + baseline_ab_split are on, only use
+            # failed trajectories from the with-skills group for reflection/skill update.
             _mgr = (self.config.env.get("skills_only_memory") or {}).get("management") or {}
             _enable_mgmt = (self.config.env.get("skills_only_memory") or {}).get("enable_dynamic_management", False)
             _baseline_ab = _enable_mgmt and _mgr.get("baseline_ab_split", False)
@@ -1928,7 +1867,7 @@ class RayPPOTrainer:
             for traj_uid in traj_uids_to_collect:
                 traj_data = traj_dict[traj_uid]
                 failed_item = build_failed_item(traj_uid, traj_data)
-                failed_item["traj_uid"] = traj_uid  # for expert_wrong_step: match (traj_uid, error_turn) back to batch
+                failed_item["traj_uid"] = traj_uid  # keep trajectory id for downstream matching/audit
                 if traj_uid in chosen_traj_info:
                     failed_item.update(chosen_traj_info[traj_uid])
                     # For summarize_success: attach one success trajectory from same group if any
@@ -1947,23 +1886,23 @@ class RayPPOTrainer:
         else:
             # Original logic: process each sample independently (for validation or old format)
             for inp, out, score in zip(inputs, outputs, scores):
-                if score <= 0:  # 失败的 trajectory
-                    # 尝试解析 task type
+                if score <= 0:  # failed trajectory
+                    # Try to infer task type
                     task_type = self._detect_task_type_from_input(inp)
                     
-                    # 检查 output 是否包含完整对话历史（包含 "Turn" 关键字）
+                    # Check whether output contains full dialogue history ("Turn" keyword)
                     if "Turn" in out and ("Observation:" in out or "Action:" in out):
-                        # 这是完整的对话历史格式，直接保存（不截断，保留完整信息）
+                        # Full dialogue-history format: store directly without truncation.
                         failed.append({
-                            'task': inp,  # 不截断，保留完整初始 prompt
-                            'trajectory': [{'action': out, 'observation': ''}],  # 完整对话历史保存在 action 字段
+                            'task': inp,  # Keep full initial prompt (no truncation)
+                            'trajectory': [{'action': out, 'observation': ''}],  # Full dialogue history is kept in action
                             'task_type': task_type,
-                            'full_dialogue': True,  # 标记这是完整对话格式
+                            'full_dialogue': True,  # Mark as full-dialogue format
                         })
                     else:
-                        # 这是旧的单 action 格式，保持原有逻辑但增加截断长度
+                        # Legacy single-action format: keep previous behavior with longer truncation.
                         failed.append({
-                            'task': inp[:2000] if len(inp) > 2000 else inp,  # 增加到 2000 字符
+                            'task': inp[:2000] if len(inp) > 2000 else inp,  # Truncate at 2000 chars
                             'trajectory': [{'action': out[:2000] if len(out) > 2000 else out, 'observation': ''}],
                             'task_type': task_type,
                             'full_dialogue': False,
@@ -1975,7 +1914,7 @@ class RayPPOTrainer:
         return capped
 
     def _detect_task_type_from_input(self, inp: str) -> str:
-        """从输入中检测任务类型"""
+        """Infer task type from input text."""
         inp_lower = inp.lower()
         if 'clean' in inp_lower:
             return 'clean'
@@ -1990,58 +1929,19 @@ class RayPPOTrainer:
         else:
             return 'pick_and_place'
 
-    def _set_expert_wrong_step_on_batch_from_error_turns(
-        self, batch: DataProto, failed_list: list, error_turns: list
-    ) -> None:
-        """
-        Set batch.non_tensor_batch['expert_wrong_step'] from (failed_list, error_turns).
-        failed_list items must have 'traj_uid'; error_turns is 1-based per failed traj, same order.
-        Indexing convention: both ERROR_TURN (from summarizer) and step_1based (batch row's step
-        within trajectory) are 1-based, matching "Turn 1", "Turn 2", ... in the dialogue sent to LLM.
-        """
-        if not failed_list or not error_turns or "traj_uid" not in batch.non_tensor_batch:
-            return
-        inp = batch.batch["input_ids"] if "input_ids" in batch.batch else batch.batch.get("prompts")
-        if inp is None:
-            return
-        n = inp.shape[0] if hasattr(inp, "shape") else len(inp)
-        traj_uid_arr = batch.non_tensor_batch["traj_uid"]
-        traj_uid_to_error_turn = {}
-        for item, et in zip(failed_list, error_turns):
-            tid = item.get("traj_uid")
-            if tid is not None and et is not None and et >= 1:
-                traj_uid_to_error_turn[tid] = et
-        # step_1based[i] = 1-based step of row i within its trajectory (matches "Turn N" / ERROR_TURN: N)
-        step_1based = np.zeros(n, dtype=np.int32)
-        traj_counter = {}
-        for i in range(n):
-            uid = traj_uid_arr[i]
-            traj_counter[uid] = traj_counter.get(uid, 0) + 1
-            step_1based[i] = traj_counter[uid]
-        expert_wrong_step = np.array([
-            traj_uid_to_error_turn.get(traj_uid_arr[i], -1) == step_1based[i]
-            for i in range(n)
-        ], dtype=bool)
-        batch.non_tensor_batch["expert_wrong_step"] = expert_wrong_step
-
-    def _update_skills_from_training_data(self, current_step_failures: list, batch: DataProto = None):
+    def _update_skills_from_training_data(self, current_step_failures: list):
         """
         Update the skill bank using failed trajectories from the current step only.
         Called every training step; uses only the failures just collected this step.
-        If batch is provided and analyze_failures returns error_turns (retrieval_obs), and
-        expert_wrong_step_penalty > 0, writes expert_wrong_step to batch so the penalty path
-        does not need to call the LLM again.
-        Returns True if batch.non_tensor_batch['expert_wrong_step'] was set by this call.
         """
-        expert_wrong_step_set = False
         if not current_step_failures:
             print("[SkillUpdate-Train] No failed trajectories from current step, skipping update")
-            return expert_wrong_step_set
+            return
 
         trajectories_to_analyze = current_step_failures
         update_config = self.config.env.skills_only_memory
 
-        # lazy-init SkillUpdater（外部 API / 本地 skill 服务见 skill_updater_kwargs_from_config）
+        # Lazy-init SkillUpdater (for external API / local skill service, see skill_updater_kwargs_from_config)
         if not hasattr(self, 'skill_updater'):
             self.skill_updater = SkillUpdater(**skill_updater_kwargs_from_config(update_config))
 
@@ -2051,9 +1951,9 @@ class RayPPOTrainer:
             retrieval_memory = self.envs.retrieval_memory
         if retrieval_memory is None:
             print("[SkillUpdate-Train] No retrieval_memory found in training envs")
-            return expert_wrong_step_set
+            return
 
-        # 保存失败轨迹到磁盘（如果配置启用）
+        # Persist failed trajectories to disk (if enabled)
         save_traj = update_config.get('update_save_traj', False)
         save_dir = self.config.trainer.get('default_local_dir', './outputs')
         if save_traj:
@@ -2063,22 +1963,23 @@ class RayPPOTrainer:
                 os.makedirs(save_dir, exist_ok=True)
                 print(f"[SkillUpdate-Train] Using {len(trajectories_to_analyze)} trajectories for save/LLM (current step)")
                 
-                # 初始化 SkillUpdater（如果还没有）以便使用其格式化方法
+                # Initialize SkillUpdater (if needed) to reuse its formatting method.
                 if not hasattr(self, 'skill_updater'):
                     self.skill_updater = SkillUpdater(**skill_updater_kwargs_from_config(update_config))
                 
-                # 格式化轨迹，使其与传给 LLM 的内容一致
+                # Format trajectories to match LLM input payloads.
                 formatted_trajectories = []
                 for traj in trajectories_to_analyze:
-                    # 只保存 task / task_type / refined_trajectory 等，不再存 original_trajectory、llm_prompt_section
+                    # Save only task / task_type / refined_trajectory, etc.
+                    # Skip original_trajectory and llm_prompt_section.
                     formatted_traj = {
                         'task': traj['task'],
                         'task_type': traj['task_type'],
                         'full_dialogue': traj.get('full_dialogue', False),
                     }
                     if 'refined_trajectory' in traj:
-                        formatted_traj['refined_trajectory'] = traj['refined_trajectory']  # AlfWorld 精炼格式
-                    # 调试：保存按 group 收集时的正确率等信息
+                        formatted_traj['refined_trajectory'] = traj['refined_trajectory']  # AlfWorld refined format
+                    # Debug: keep group-level stats for diagnostics.
                     for key in ('group_uid', 'group_success_rate', 'group_size', 'group_failed_count'):
                         if key in traj:
                             formatted_traj[key] = traj[key]
@@ -2106,18 +2007,6 @@ class RayPPOTrainer:
             return_metadata=True,
         )
 
-        # 用 reflection 得到的 error_turns 写回 batch，供本步 penalty 使用
-        if batch is not None and self.config.reward_model.get("expert_wrong_step_penalty", 0.0) > 0:
-            error_turns = llm_metadata.get("error_turns", [])
-            if error_turns and len(error_turns) == len(trajectories_to_analyze):
-                self._set_expert_wrong_step_on_batch_from_error_turns(
-                    batch, trajectories_to_analyze, error_turns
-                )
-                expert_wrong_step_set = True
-                num_marked = int(batch.non_tensor_batch["expert_wrong_step"].sum())
-                if num_marked > 0:
-                    print(f"[SkillUpdate-Train] Set expert_wrong_step for {num_marked} step(s) from summarizer ERROR_TURN")
-
         # Save complete LLM call information (prompt, response, metadata)
         # Save LLM call info whenever we ran skill update (so we can verify input/output even if save_traj=False)
         save_dir = self.config.trainer.get('default_local_dir', './outputs')
@@ -2141,7 +2030,8 @@ class RayPPOTrainer:
             print(f"[SkillUpdate-Train] Warning: Failed to save LLM call info: {e}")
         if save_traj:
             try:
-                # 把输入给 summarizer 的 query 与 ERROR_TURN 写回 failed_trajectories JSON（存记忆需要）
+                # Write summarizer query and ERROR_TURN back to failed_trajectories JSON
+                # for memory persistence.
                 summarizer_queries = llm_metadata.get('summarizer_queries', [])
                 error_turns = llm_metadata.get('error_turns', [])
                 if summarizer_queries or error_turns:
@@ -2186,7 +2076,7 @@ class RayPPOTrainer:
             save_path = os.path.join(save_dir, f'updated_skills_train_step{self.global_steps}.json')
             retrieval_memory.save_skills(save_path)
             self._sync_skills_to_retrieval_server(retrieval_memory)
-        return expert_wrong_step_set
+        return
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -2494,7 +2384,8 @@ class RayPPOTrainer:
                             # Prefer trajectory-level key for recording (works with/without enable_dynamic_management)
                             per_step_list = None
                             ti_record = None
-                            # 优先用 by_traj + traj_index：与 batch 行数一致，按轨迹取首行即可得到整条轨迹的全 step 列表
+                            # Prefer by_traj + traj_index: row count matches batch rows,
+                            # and selecting the first row per trajectory recovers the full step list.
                             if nt.get("per_step_retrieved_by_traj") is not None and nt.get("traj_index") is not None:
                                 per_step_list = [nt["per_step_retrieved_by_traj"]]
                                 ti_record = [nt["traj_index"]]
@@ -2541,8 +2432,6 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
-                    # Skill 更新与存记忆提前：用 episode_rewards 收集失败轨迹，一次 summarizer 得到 ERROR_TURN 并写回 expert_wrong_step，避免步骤 2 再调一次 LLM
-                    expert_wrong_step_set_by_skill_update = False
                     if self.config.env.get('skills_only_memory', {}).get('enable_dynamic_update', False):
                         update_source = self.config.env.get('skills_only_memory', {}).get('update_source', 'validation')
                         if update_source in ['train', 'all']:
@@ -2555,32 +2444,9 @@ class RayPPOTrainer:
                                 _train_inputs, _train_outputs, _train_scores, batch=batch,
                                 with_skills_mask=batch.non_tensor_batch.get("with_skills_mask"),
                             )
-                            expert_wrong_step_set_by_skill_update = self._update_skills_from_training_data(
-                                current_step_failures=new_failures, batch=batch
-                            )
-                    # expert_wrong_step_penalty > 0 时，若未在 skill 更新中写回，则必须调一次 summarizer 获得 ERROR_TURN（与 retrieval_obs / use_skills_only_memory 无关）
-                    if (
-                        self.config.reward_model.get("expert_wrong_step_penalty", 0.0) > 0
-                        and not expert_wrong_step_set_by_skill_update
-                    ):
-                        self._apply_expert_wrong_step_from_llm(batch)
+                            self._update_skills_from_training_data(current_step_failures=new_failures)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
-                        # Apply expert wrong-step penalty to per-step rewards (GiGPO step-level signal).
-                        expert_penalty = self.config.reward_model.get("expert_wrong_step_penalty", 0.0)
-                        if expert_penalty > 0 and "expert_wrong_step" in batch.non_tensor_batch:
-                            r = np.asarray(batch.non_tensor_batch["rewards"], dtype=np.float32)
-                            mask = np.asarray(batch.non_tensor_batch["expert_wrong_step"], dtype=bool)
-                            n_penalized = int(mask.sum())
-                            if n_penalized > 0:
-                                idx_penalized = np.where(mask)[0]
-                                for idx in idx_penalized[:5]:  # debug: first 5
-                                    rb, ra = float(r[idx]), float(r[idx]) - expert_penalty
-                                    print(f"[ExpertWrongStep-Penalty] GiGPO step_idx={int(idx)} reward_before={rb:.4f} reward_after={ra:.4f} penalty={expert_penalty:.4f}")
-                                if n_penalized > 5:
-                                    print(f"[ExpertWrongStep-Penalty] GiGPO total {n_penalized} steps penalized (shown first 5)")
-                            r[mask] -= expert_penalty
-                            batch.non_tensor_batch["rewards"] = r
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma

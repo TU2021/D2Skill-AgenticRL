@@ -21,14 +21,10 @@ class EpisodeRewardManager:
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, normalize_by_length=False, expert_wrong_step_penalty=0.0) -> None:
+    def __init__(self, tokenizer, num_examine, normalize_by_length=False) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.normalize_by_length = normalize_by_length
-        # When > 0: subtract this from score for the sampled step that is marked as expert_wrong_step (GRPO/GAE).
-        # Only the specific sample (that step) is penalized, not all samples at that step index.
-        # Scale with success reward: e.g. if success reward=10, use 1.0~2.0 (10–20%) or 2~5 for stronger signal. Set to 0 to disable.
-        self.expert_wrong_step_penalty = float(expert_wrong_step_penalty)
 
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
@@ -43,8 +39,6 @@ class EpisodeRewardManager:
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
-        penalty_debug_printed = 0
-        n_penalized_this_batch = 0
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -82,16 +76,6 @@ class EpisodeRewardManager:
                 score = episode_rewards / episode_lengths
             else:
                 score = episode_rewards
-            # Apply expert wrong-step penalty only for this sampled step (not for other steps).
-            if self.expert_wrong_step_penalty != 0:
-                wrong_step = bool(data_item.non_tensor_batch.get('expert_wrong_step', False))
-                if wrong_step:
-                    n_penalized_this_batch += 1
-                    score_before = float(score)
-                    score = score - self.expert_wrong_step_penalty
-                    if penalty_debug_printed < 5:
-                        print(f"[ExpertWrongStep-Penalty] GRPO/GAE sample_idx={i} score_before={score_before:.4f} score_after={score:.4f} penalty={self.expert_wrong_step_penalty:.4f}")
-                        penalty_debug_printed += 1
             reward_tensor[i, valid_response_length - 1] = torch.tensor(score, dtype=torch.float32, device=prompt_ids.device)
 
             if data_source not in already_print_data_sources:
@@ -102,9 +86,6 @@ class EpisodeRewardManager:
                 print(f"[{data_source}][prompt]", prompt_str)
                 print(f"[{data_source}][response]", response_str)
                 print(f"[{data_source}][score]", score)
-
-        if n_penalized_this_batch > 5:
-            print(f"[ExpertWrongStep-Penalty] GRPO/GAE batch: {n_penalized_this_batch} samples penalized (shown first 5)")
 
         if return_dict:
             return {

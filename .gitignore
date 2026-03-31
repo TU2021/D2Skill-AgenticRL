@@ -10,6 +10,7 @@
 /models/
 /outputs/
 /train_sft/
+/env.sh
 *.whl
 
 # Python cache/build artifacts

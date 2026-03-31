@@ -603,7 +603,6 @@ TASK_REFLECTION:
     ) -> List[Optional[int]]:
         """
         Call reflect LLM on each failed trajectory to get FIRST_ERROR_STEP (1-based).
-        Used for expert_wrong_step labeling when skill update did not run.
         Returns list of Optional[int] in same order as failed_trajectories.
         """
         if not failed_trajectories:

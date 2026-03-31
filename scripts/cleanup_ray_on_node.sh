@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# 在目标节点上执行以清理 Ray 残留进程（例如：srun -p gpu -w hd02-gpu1-0033 bash scripts/cleanup_ray_on_node.sh）
+# Run this on the target node to clean up stale Ray processes
+# (example: srun -p gpu -w hd02-gpu1-0033 bash scripts/cleanup_ray_on_node.sh)
 set -e
-echo "=== 当前节点: $(hostname) ==="
-echo "查找 Ray 相关进程..."
+echo "=== Current node: $(hostname) ==="
+echo "Searching for Ray-related processes..."
 ROWS=$(ps -u "$USER" -o pid,cmd --no-headers 2>/dev/null | grep -E 'ray|raylet|gcs_server|dashboard/agent|plasma_store' | grep -v grep || true)
 if [[ -z "$ROWS" ]]; then
-  echo "未发现 Ray 相关进程。"
+  echo "No Ray-related processes found."
   exit 0
 fi
 echo "$ROWS"
 PIDS=$(echo "$ROWS" | awk '{print $1}')
-echo "即将 kill -9: $PIDS"
+echo "About to run kill -9 on: $PIDS"
 for pid in $PIDS; do
-  kill -9 "$pid" 2>/dev/null && echo "已结束 PID $pid" || echo "结束 $pid 失败（可能已退出）"
+  kill -9 "$pid" 2>/dev/null && echo "Terminated PID $pid" || echo "Failed to terminate $pid (possibly already exited)"
 done
-echo "清理完成。"
+echo "Cleanup complete."
