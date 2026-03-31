@@ -159,7 +159,7 @@ Key config flags added by these scripts:
 +env.use_skills_only_memory=True
 +env.skills_only_memory.skills_json_path=memory_data/alfworld/claude_style_skills.json
 +env.skills_only_memory.top_k=6              
-+env.skills_only_memory.enable_dynamic_management=False
++env.skills_only_memory.enable_dynamic_update=True
 +env.skills_only_memory.update_threshold=0.4
 +env.skills_only_memory.max_new_skills=3
 ```
@@ -194,7 +194,7 @@ All parameters live under `env.skills_only_memory.*` (Hydra / OmegaConf).
 | `embedding_model_path` | str | `"Qwen/Qwen3-Embedding-0.6B"` | Local path or HF model ID.  Only used when `retrieval_mode=embedding`. |
 | `top_k` | int | `6` | Number of general skills injected per episode. |
 | `task_specific_top_k` | int | `None` | Max task-specific skills per episode.  `None` = all (template) / same as `top_k` (embedding). |
-| `enable_dynamic_management` | bool | `False` | If False: current step-by-step sample/add/retrieve. If True: dynamic management (A/B half group, task_utility, EMA, UCB retrieval, intrinsic reward); params under `env.skills_only_memory.dynamic_management`. |
+| `enable_dynamic_update` | bool | `False` | Evolve the skill bank during training using validation failures. |
 | `update_threshold` | float | `0.4` | Min success rate below which skills are updated. |
 | `max_new_skills` | int | `3` | Maximum new skills added per update cycle. |
 ---

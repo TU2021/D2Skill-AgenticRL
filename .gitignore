@@ -1,1 +1,17 @@
- 
+/checkpoints/
+/docker/
+/docs/
+/examples/
+/memory_data/
+/RetroAgent-main/
+/skill_generation/
+/SkillRL_origin/
+/swanlog/
+/models/
+/outputs/
+*.whl
+
+# Python cache/build artifacts
+**/__pycache__/
+*.py[cod]
+*.egg-info/

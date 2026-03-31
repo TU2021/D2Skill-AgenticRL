@@ -94,19 +94,20 @@ Admissible actions at this step:
 ## Relevant Experience
 ====================
 
-Below are past experiences retrieved from memory that may be relevant.
+Below are past experiences retrieved from memory. They may include:
 
-You should review these experiences before deciding your next action.
+- **Task-level experience**: for this kind of task as a whole (what to aim for, what to avoid).
+- **Step-level experience**: for the current situation (what to do at this step when the observation is similar).
+
+You should review both before deciding your next action.
 
 When reasoning, you may:
 
-- Compare the current situation with past experiences
-- Reuse successful actions if the situations are similar
-- Avoid actions that previously led to failure
-- Use past experience to guide your next step when helpful
+- Use task-level experience to guide your overall plan and avoid known pitfalls
+- Use step-level experience when the current observation matches the described situation
+- Reuse successful actions if the situations are similar; avoid actions that previously led to failure
 
-If a retrieved experience seems relevant, consider it during your reasoning.
-If it is not relevant, you may ignore it.
+Warning: These lessons may be outdated. Use them only if they align with your current observation.
 
 Retrieved experiences:
 {retrieved_memories}
@@ -119,12 +120,10 @@ Retrieved experiences:
 For the current step, you should follow this process:
 
 1. Analyze the current observation
-2. Review the retrieved experiences
-3. Think about whether any past experience applies
-4. Reason step-by-step
-5. Choose the best admissible action
+2. Review the retrieved experiences and think about whether any past experience applies
+3. Reason step-by-step and choose the best admissible action
 
-Now it's your turn to take one action for the current step.
-You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """

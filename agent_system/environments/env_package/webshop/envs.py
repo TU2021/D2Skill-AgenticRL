@@ -13,9 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import ray
 import gym
 import numpy as np
+
+
+def _ensure_sys_argv_for_ray():
+    """Ray connect() uses realpath(sys.argv[0]); argv[0] can be None (-c / shutdown)."""
+    if not getattr(sys, "argv", None):
+        sys.argv = [""]
+    elif len(sys.argv) == 0:
+        sys.argv.append("")
+    elif sys.argv[0] is None:
+        sys.argv[0] = ""
 
 # -----------------------------------------------------------------------------
 # Ray remote worker actor -----------------------------------------------------
@@ -104,6 +115,7 @@ class WebshopMultiProcessEnv(gym.Env):
 
         # Initialize Ray if not already initialized
         if not ray.is_initialized():
+            _ensure_sys_argv_for_ray()
             ray.init()
 
         self.group_n = group_n
@@ -212,26 +224,37 @@ class WebshopMultiProcessEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def close(self):
-        if getattr(self, '_closed', False):
+        if getattr(self, "_closed", False):
+            return
+        workers = getattr(self, "_workers", None)
+        if not workers:
+            self._closed = True
+            return
+        # Interpreter exit: Ray may already be shutdown; remote() would trigger broken auto_init.
+        if not ray.is_initialized():
+            self._closed = True
             return
 
-        # Close all workers and kill Ray actors
-        close_futures = []
-        for worker in self._workers:
-            future = worker.close.remote()
-            close_futures.append(future)
-        
-        # Wait for all workers to close
-        ray.get(close_futures)
-        
-        # Kill all Ray actors
-        for worker in self._workers:
-            ray.kill(worker)
-            
-        self._closed = True
+        _ensure_sys_argv_for_ray()
+        try:
+            close_futures = [w.close.remote() for w in workers]
+            ray.get(close_futures)
+            for w in workers:
+                try:
+                    ray.kill(w)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._closed = True
 
     def __del__(self):  # noqa: D401
-        self.close()
+        # Avoid Ray during teardown; close() already guards ray.is_initialized().
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # -----------------------------------------------------------------------------

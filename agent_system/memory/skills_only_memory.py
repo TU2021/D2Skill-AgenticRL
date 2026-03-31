@@ -28,9 +28,17 @@ Supports two retrieval modes:
 """
 
 import json
+import math
 import os
-from typing import Dict, Any, List, Optional, Union
+import re
+from typing import Dict, Any, List, Optional, Tuple, Union
 from .base import BaseMemory
+
+# Defaults for dynamic memory management fields (missing => 0)
+DEFAULT_UTILITY = 0.0
+DEFAULT_RETRIEVAL_COUNT = 0
+DEFAULT_LAST_RETRIEVAL_STEP = 0
+DEFAULT_CREATED_AT_STEP = 0
 
 
 class SkillsOnlyMemory(BaseMemory):
@@ -67,14 +75,21 @@ class SkillsOnlyMemory(BaseMemory):
         skill_text_for_retrieval: str = "full",
         load_initial_skills: bool = True,
         similarity_threshold: Optional[float] = None,
+        skill_retrieval_timeout: int = 60,
+        retrieval_top_2k: Optional[int] = None,
+        retrieval_alpha: Optional[float] = None,
+        retrieval_ucb_c: float = 0.5,
+        eviction_enabled: bool = False,
     ):
         """
         Args:
             skills_json_path:     Path to Claude-style skills JSON file. Can be None when load_initial_skills=False.
+            skill_retrieval_timeout: Timeout in seconds for remote retrieval HTTP requests (default 60).
             retrieval_mode:       ``"template"`` or ``"embedding"``.
             skill_text_for_retrieval: Which skill fields to use as document input.
                                   ``"full"`` = title + principle + when_to_apply (default);
-                                  ``"when_to_apply"`` = only when_to_apply.
+                                  ``"when_to_apply"`` = only when_to_apply;
+                                  ``"principle"`` = only principle.
             load_initial_skills:  If False, do not load from skills_json_path; start with empty skill bank.
             similarity_threshold: If set (embedding mode), only return skills with similarity >= this value.
             embedding_model_path: Local path (or HF model ID) for the
@@ -101,6 +116,10 @@ class SkillsOnlyMemory(BaseMemory):
                                   embedding models on cuda:0..num_gpus-1 and
                                   encode query batches in parallel (one URL server
                                   can thus use multiple GPUs).
+            retrieval_top_2k:     For SimUtil-UCB: take this many by similarity first (default 2*top_k).
+            retrieval_alpha:     SimUtil-UCB: score = alpha*sim + (1-alpha)*(utility+UCB). None => similarity only.
+            retrieval_ucb_c:      SimUtil-UCB exploration coefficient c.
+            eviction_enabled:   When True, trainer may call ``evict_excess_skills`` at validation steps.
         """
         if retrieval_mode not in ("template", "embedding"):
             raise ValueError(
@@ -111,9 +130,15 @@ class SkillsOnlyMemory(BaseMemory):
             if not skills_json_path or not os.path.exists(skills_json_path):
                 raise FileNotFoundError(f"Skills file not found: {skills_json_path}")
             with open(skills_json_path, 'r') as f:
-                self.skills = json.load(f)
+                loaded = json.load(f)
+            self.skills = {
+                "task_skills": loaded.get("task_skills") or [],
+                "step_skills": loaded.get("step_skills") or [],
+            }
         else:
-            self.skills = {"general_skills": [], "task_specific_skills": {}, "common_mistakes": []}
+            self.skills = {"task_skills": [], "step_skills": []}
+        self.skills.setdefault("task_skills", [])
+        self.skills.setdefault("step_skills", [])
 
         self.retrieval_mode = retrieval_mode
         self.embedding_model_path = embedding_model_path or "Qwen/Qwen3-Embedding-0.6B"
@@ -133,101 +158,53 @@ class SkillsOnlyMemory(BaseMemory):
             if not self._retrieval_service_urls:
                 self._retrieval_service_urls = None
 
-        if skill_text_for_retrieval not in ("full", "when_to_apply"):
+        if skill_text_for_retrieval not in ("full", "when_to_apply", "principle"):
             raise ValueError(
-                f"skill_text_for_retrieval must be 'full' or 'when_to_apply', got '{skill_text_for_retrieval}'"
+                f"skill_text_for_retrieval must be 'full', 'when_to_apply', or 'principle', got '{skill_text_for_retrieval}'"
             )
         self._skill_text_for_retrieval = skill_text_for_retrieval
         self.load_initial_skills = load_initial_skills
         self.similarity_threshold = similarity_threshold
+        self._retrieval_timeout = max(60, int(skill_retrieval_timeout))
+        self._retrieval_top_2k = retrieval_top_2k
+        self._retrieval_alpha = retrieval_alpha
+        self._retrieval_ucb_c = float(retrieval_ucb_c)
+        self._eviction_enabled = bool(eviction_enabled)
 
         # Lazy-initialised embedding state (only used in embedding mode, in-process)
         self._embedding_model = None
         self._embedding_models: Optional[List[Any]] = None  # when _num_gpus > 1
-        self._skill_embeddings_cache: Optional[Dict] = None
+        # Caches for task_skills and step_skills (keyed by retrieval_obs)
+        self._task_skill_embeddings_cache: Optional[Dict] = None
+        self._step_skill_embeddings_cache: Optional[Dict] = None
 
-        n_general = len(self.skills.get('general_skills', []))
-        n_task = sum(len(v) for v in self.skills.get('task_specific_skills', {}).values())
-        n_mistakes = len(self.skills.get('common_mistakes', []))
+        self._normalize_all_skill_meta()
+        n_tsk = len(self.skills.get('task_skills', []))
+        n_stp = len(self.skills.get('step_skills', []))
         print(
-            f"[SkillsOnlyMemory] Loaded skills: {n_general} general, "
-            f"{n_task} task-specific, {n_mistakes} mistakes  "
+            f"[SkillsOnlyMemory] Loaded skills: {n_tsk} task_skills, {n_stp} step_skills  "
             f"| retrieval_mode={retrieval_mode}"
             + (f" | remote={len(self._retrieval_service_urls)} server(s)" if self._retrieval_service_urls else "")
             + (f" | num_gpus={self._num_gpus}" if self._num_gpus > 1 else "")
         )
 
-        # In embedding mode without remote URL, pre-compute skill embeddings eagerly.
-        if retrieval_mode == "embedding" and not self._retrieval_service_urls:
-            self._compute_skill_embeddings()
+    def _normalize_skill_meta(self, skill: Dict[str, Any]) -> None:
+        """Ensure dynamic memory fields exist; missing => 0. Modifies skill in place."""
+        if skill.get("utility") is None:
+            skill["utility"] = DEFAULT_UTILITY
+        if skill.get("retrieval_count") is None:
+            skill["retrieval_count"] = DEFAULT_RETRIEVAL_COUNT
+        if skill.get("last_retrieval_step") is None:
+            skill["last_retrieval_step"] = DEFAULT_LAST_RETRIEVAL_STEP
+        if skill.get("created_at_step") is None:
+            skill["created_at_step"] = DEFAULT_CREATED_AT_STEP
 
-    # ------------------------------------------------------------------ #
-    # Task-type detection (template mode)                                  #
-    # ------------------------------------------------------------------ #
-
-    def _detect_task_type(self, task_description: str) -> str:
-        """
-        Infer the task category from ``task_description`` using keyword rules.
-
-        Auto-detects whether the loaded skills belong to ALFWorld or WebShop
-        by inspecting the task-specific skill keys.
-        """
-        task_specific = self.skills.get('task_specific_skills', {})
-        goal = task_description.lower()
-
-        # ---- ALFWorld categories ----------------------------------------
-        if 'pick_and_place' in task_specific or 'clean' in task_specific:
-            if 'look at' in goal and 'under' in goal:
-                return 'look_at_obj_in_light'
-            elif 'clean' in goal:
-                return 'clean'
-            elif 'heat' in goal:
-                return 'heat'
-            elif 'cool' in goal:
-                return 'cool'
-            elif 'examine' in goal or 'find' in goal:
-                return 'examine'
-            else:
-                return 'pick_and_place'
-
-        # ---- WebShop categories -----------------------------------------
-        elif 'apparel' in task_specific or 'electronics' in task_specific:
-            if any(kw in goal for kw in [
-                'shirt', 'dress', 'jacket', 'pant', 'coat', 'sweater',
-                'blouse', 'clothing', 'clothes', 't-shirt',
-            ]):
-                return 'apparel'
-            elif any(kw in goal for kw in [
-                'shoe', 'boot', 'sneaker', 'sandal', 'heel', 'slipper',
-                'footwear',
-            ]):
-                return 'footwear'
-            elif any(kw in goal for kw in [
-                'laptop', 'phone', 'computer', 'tablet', 'charger',
-                'cable', 'headphone', 'speaker', 'camera', 'electronic',
-            ]):
-                return 'electronics'
-            elif any(kw in goal for kw in [
-                'necklace', 'ring', 'bracelet', 'earring', 'watch',
-                'jewelry', 'bag', 'purse', 'wallet',
-            ]):
-                return 'accessories'
-            elif any(kw in goal for kw in [
-                'furniture', 'lamp', 'curtain', 'pillow', 'bedding',
-                'decor', 'candle', 'vase', 'rug',
-            ]):
-                return 'home_decor'
-            elif any(kw in goal for kw in [
-                'cream', 'lotion', 'shampoo', 'conditioner', 'moisturizer',
-                'serum', 'makeup', 'beauty', 'vitamin', 'supplement',
-            ]):
-                return 'beauty_health'
-            else:
-                return 'other'
-
-        # ---- Fallback: first key in task_specific_skills, or 'unknown' --
-        else:
-            return next(iter(task_specific), 'unknown')
+    def _normalize_all_skill_meta(self) -> None:
+        """Normalize utility/retrieval_count/last_retrieval_step/created_at_step for all skills in pool."""
+        for s in self.skills.get("task_skills", []):
+            self._normalize_skill_meta(s)
+        for s in self.skills.get("step_skills", []):
+            self._normalize_skill_meta(s)
 
     # ------------------------------------------------------------------ #
     # Embedding helpers                                                    #
@@ -269,10 +246,18 @@ class SkillsOnlyMemory(BaseMemory):
         return self._embedding_model
 
     def _skill_to_text(self, skill: Dict[str, Any], mode: Optional[str] = None) -> str:
-        """Build the text used as document input for retrieval. mode overrides self._skill_text_for_retrieval."""
+        """Build the text used as document input for retrieval. mode overrides self._skill_text_for_retrieval.
+        If skill has non-empty 'retrieval_obs' (task+obs at error turn), use that for embedding (server/trainer auto-adapt)."""
+        ro = (skill.get("retrieval_obs") or "").strip()
+        if ro:
+            return ro
         use = (mode or self._skill_text_for_retrieval)
+        if use == "retrieval_obs":
+            use = self._skill_text_for_retrieval
         if use == "when_to_apply":
             return (skill.get("when_to_apply") or "").strip()
+        if use == "principle":
+            return (skill.get("principle") or "").strip()
         parts = []
         for field in ("title", "principle", "when_to_apply"):
             val = (skill.get(field) or "").strip()
@@ -280,218 +265,305 @@ class SkillsOnlyMemory(BaseMemory):
                 parts.append(val)
         return ". ".join(parts)
 
-    def _apply_similarity_threshold(
-        self,
-        general_skills: List[Dict[str, Any]],
-        task_specific_skills: List[Dict[str, Any]],
-    ) -> tuple:
-        """If similarity_threshold is set (embedding mode), keep only skills with similarity >= threshold."""
-        if self.similarity_threshold is None:
-            return general_skills, task_specific_skills
-        th = self.similarity_threshold
-        # Only filter when we have numeric similarities (embedding mode); template mode has all None → leave as-is
-        gs = general_skills
-        ts = task_specific_skills
-        if any(s.get("similarity") is not None for s in general_skills + task_specific_skills):
-            gs = [s for s in general_skills if s.get("similarity") is not None and s["similarity"] >= th]
-            ts = [s for s in task_specific_skills if s.get("similarity") is not None and s["similarity"] >= th]
-        return gs, ts
+    def _skill_item_key(self, skill: Dict, index: int) -> str:
+        """Stable key for cache reuse: skill_id if present, else index-based."""
+        return (skill.get("skill_id") or f"_{index}")
 
-    def _compute_skill_embeddings(self, mode: Optional[str] = None) -> Dict:
+    def replace_skills_keep_cache_incremental(self, new_skills: Dict[str, Any]) -> None:
         """
-        Pre-compute and cache normalised embeddings for every skill.
-        mode: "full" | "when_to_apply"; defaults to self._skill_text_for_retrieval. Cache is per mode.
+        Replace skill bank but keep embedding cache incremental when possible.
+        When the new list is a prefix-preserving superset of the cached list (same skill_ids
+        in order for the prefix), only encode the new tail and merge. Otherwise clear cache.
+        Used by the retrieval server on reload_skills to avoid re-encoding the full set every sync.
         """
-        use_mode = mode or self._skill_text_for_retrieval
-        if self._skill_embeddings_cache is None:
-            self._skill_embeddings_cache = {}
-        if use_mode in self._skill_embeddings_cache:
-            return self._skill_embeddings_cache[use_mode]
-
         import numpy as np
-
-        general_items = [
-            ('general', None, s)
-            for s in self.skills.get('general_skills', [])
-        ]
-        task_items = [
-            ('task_specific', task_type, s)
-            for task_type, skills in self.skills.get('task_specific_skills', {}).items()
-            for s in skills
-        ]
-        all_items = general_items + task_items
-        texts = [self._skill_to_text(item[2], use_mode) for item in all_items]
-
-        if not texts:
-            # Empty skill bank: avoid model.encode([]) which may return (0,0) and break matmul later
-            embeddings = np.array([]).reshape(0, 0)
-        else:
+        new_skills = {
+            "task_skills": new_skills.get("task_skills") or [],
+            "step_skills": new_skills.get("step_skills") or [],
+        }
+        for pool, attr in [("task_skills", "_task_skill_embeddings_cache"), ("step_skills", "_step_skill_embeddings_cache")]:
+            new_items = new_skills.get(pool, [])
+            existing = getattr(self, attr, None)
+            if not new_items:
+                setattr(self, attr, None)
+                continue
+            cached_items = (existing.get("items", []) if existing else []) or []
+            if not existing or len(cached_items) == 0 or len(new_items) < len(cached_items):
+                setattr(self, attr, None)
+                continue
+            ids_cached = tuple(s.get("skill_id", f"_{i}") for i, s in enumerate(cached_items))
+            ids_new_prefix = tuple(s.get("skill_id", f"_{i}") for i, s in enumerate(new_items[: len(cached_items)]))
+            if ids_cached != ids_new_prefix:
+                setattr(self, attr, None)
+                continue
+            tail = new_items[len(cached_items) :]
+            if not tail:
+                # Same list (or same length), just update items reference
+                setattr(self, attr, {"items": list(new_items), "embeddings": existing["embeddings"]})
+                continue
+            # Encode only the tail and concatenate
+            texts = [(s.get("retrieval_obs") or "").strip() or self._skill_to_text(s) for s in tail]
             model = self._get_embedding_model()
-            embeddings = model.encode(
+            tail_embs = model.encode(
                 texts,
                 normalize_embeddings=True,
                 show_progress_bar=False,
                 convert_to_numpy=True,
             )
+            if hasattr(tail_embs, "shape") and len(tail_embs.shape) == 1:
+                tail_embs = np.expand_dims(tail_embs, axis=0)
+            old_embs = existing["embeddings"]
+            merged = np.concatenate([old_embs, tail_embs], axis=0)
+            setattr(self, attr, {"items": list(new_items), "embeddings": merged})
+        self.skills = new_skills
 
-        self._skill_embeddings_cache[use_mode] = {
-            'items': all_items,
-            'embeddings': embeddings,
-            'n_general': len(general_items),
-        }
-        print(
-            f"[SkillsOnlyMemory] Cached embeddings for {len(all_items)} skills (mode={use_mode}) "
-            f"({len(general_items)} general + {len(task_items)} task-specific)"
-        )
-        return self._skill_embeddings_cache[use_mode]
-
-    def _embedding_retrieve(
-        self,
-        task_description: str,
-        top_k_general: int,
-        top_k_task_specific: int,
-    ):
-        """
-        Retrieve the most relevant general and task-specific skills using
-        cosine similarity between the task description and all cached skill
-        embeddings.
-
-        Args:
-            task_description:   Free-form task goal string.
-            top_k_general:      Number of general skills to return.
-            top_k_task_specific: Number of task-specific skills to return
-                                 (searched across **all** categories).
-
-        Returns:
-            Tuple of (general_skills, task_specific_skills).
-        """
+    def _compute_pool_embeddings(self, pool: str) -> Optional[Dict]:
+        """Compute and cache embeddings for task_skills or step_skills using retrieval_obs. pool is 'task_skills' or 'step_skills'.
+        Reuses existing cache when skill set is unchanged (same length and same skill_ids order); cache is cleared on add_skills / load_skills / remove_skill."""
         import numpy as np
-
-        cache = self._compute_skill_embeddings()
-        n_skills = cache['embeddings'].shape[0]
-        if n_skills == 0:
-            return [], [], [], []
+        items = self.skills.get(pool, [])
+        attr = "_task_skill_embeddings_cache" if pool == "task_skills" else "_step_skill_embeddings_cache"
+        existing = getattr(self, attr, None)
+        if not items:
+            if existing is None:
+                setattr(self, attr, {"items": [], "embeddings": np.array([]).reshape(0, 0)})
+            return getattr(self, attr)
+        cached_items = existing.get("items", []) if existing else []
+        if existing is not None and len(cached_items) == len(items):
+            # Reuse only if skill_id sequence matches (avoid wrong reuse when same length but different content)
+            ids_now = tuple(s.get("skill_id", f"_{i}") for i, s in enumerate(items))
+            ids_cached = tuple(s.get("skill_id", f"_{i}") for i, s in enumerate(cached_items))
+            if ids_now == ids_cached:
+                return existing
+        texts = [(s.get("retrieval_obs") or "").strip() or self._skill_to_text(s) for s in items]
         model = self._get_embedding_model()
-
-        query_emb = model.encode(
-            [task_description],
+        embeddings = model.encode(
+            texts,
             normalize_embeddings=True,
             show_progress_bar=False,
             convert_to_numpy=True,
-        )[0]  # shape: (dim,)
+        )
+        if hasattr(embeddings, "shape") and len(embeddings.shape) == 1:
+            embeddings = np.expand_dims(embeddings, axis=0)
+        cache = {"items": list(items), "embeddings": embeddings}
+        if pool == "task_skills":
+            self._task_skill_embeddings_cache = cache
+        else:
+            self._step_skill_embeddings_cache = cache
+        return cache
 
-        sims = cache['embeddings'] @ query_emb  # cosine similarity, shape: (n,)
-
-        n_general = cache['n_general']
-        general_sims = sims[:n_general]
-        task_sims = sims[n_general:]
-
-        # Top-k general skills
-        general_idx = np.argsort(general_sims)[::-1][:top_k_general]
-        general_skills = [cache['items'][int(i)][2] for i in general_idx]
-        general_scores = [float(general_sims[i]) for i in general_idx]
-
-        # Top-k task-specific skills (cross-category search)
-        task_idx = np.argsort(task_sims)[::-1][:top_k_task_specific]
-        task_skills = [cache['items'][n_general + int(i)][2] for i in task_idx]
-        task_scores = [float(task_sims[i]) for i in task_idx]
-
-        return general_skills, task_skills, general_scores, task_scores
-
-    def _embedding_retrieve_batch(
+    def _apply_simutil_ucb(
         self,
-        task_descriptions: List[str],
-        top_k_general: int,
-        top_k_task_specific: int,
-        mode: Optional[str] = None,
-    ) -> List[tuple]:
+        pool_name: str,
+        indices_2k: List[int],
+        sims_1d: "np.ndarray",
+        top_k: int,
+    ) -> List[int]:
         """
-        Batch version of _embedding_retrieve: encode all queries once (or in
-        parallel across num_gpus when > 1), then compute top-k for each.
-        mode: override for skill document (full / when_to_apply); defaults to self._skill_text_for_retrieval.
+        From top-2k indices by similarity, compute score = alpha*sim + (1-alpha)*(utility+UCB)
+        and return top_k indices by score. Uses pool's utility/retrieval_count.
         """
         import numpy as np
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        items = self.skills.get(pool_name, [])
+        alpha = self._retrieval_alpha
+        c = self._retrieval_ucb_c
+        if alpha is None or not indices_2k:
+            return list(indices_2k[:top_k])
+        N = sum(int(s.get("retrieval_count", 0)) for s in items)
+        # When N=0 no skill has been retrieved yet; use log(2) so UCB is positive for exploration
+        log_N = math.log(max(2, 1 + N)) if N >= 0 else math.log(2)
+        scored: List[Tuple[float, int]] = []
+        for idx in indices_2k:
+            sim = float(sims_1d[idx])
+            sim_norm = (sim + 1.0) / 2.0 if sim >= -1 else 0.0  # map [-1,1] -> [0,1]
+            skill = items[idx] if 0 <= idx < len(items) else {}
+            self._normalize_skill_meta(skill)
+            u = float(skill.get("utility", 0))
+            n = int(skill.get("retrieval_count", 0))
+            denom = 1 + n
+            exploration_bonus = c * (math.sqrt(log_N / denom) if log_N > 0 and denom > 0 else 0.0)
+            score = alpha * sim_norm + (1.0 - alpha) * (u + exploration_bonus)
+            scored.append((score, idx))
+        scored.sort(key=lambda x: -x[0])
+        return [idx for _, idx in scored[:top_k]]
 
-        if not task_descriptions:
-            return []
+    def _get_skill_ranking_meta(self, pool_name: str, idx: int, sim_val: float) -> Dict[str, Any]:
+        """
+        Return utility, UCB, and retrieval_score for a skill (for logging in retrieved_skills JSON).
+        When retrieval_alpha is set: score = alpha*sim_norm + (1-alpha)*(utility+UCB).
+        When not set: no UCB, retrieval_score = sim_norm (or similarity for display).
+        """
+        items = self.skills.get(pool_name, [])
+        skill = items[idx] if 0 <= idx < len(items) else {}
+        self._normalize_skill_meta(skill)
+        u = float(skill.get("utility", 0))
+        sim_norm = (float(sim_val) + 1.0) / 2.0 if float(sim_val) >= -1 else 0.0
+        alpha = self._retrieval_alpha
+        c = self._retrieval_ucb_c
+        if alpha is None:
+            return {"utility": u, "ucb": 0.0, "retrieval_score": sim_norm}
+        n = int(skill.get("retrieval_count", 0))
+        N = sum(int(s.get("retrieval_count", 0)) for s in items)
+        # 正常 UCB：log(1+N)，当 N=0 时 log_N=0，自然得到 UCB=0，不再额外“抬高”或“强制为 0”
+        log_N = math.log(1 + N) if N > 0 else 0.0
+        denom = 1 + n
+        exploration_bonus = c * (math.sqrt(log_N / denom) if log_N > 0 and denom > 0 else 0.0)
+        score = alpha * sim_norm + (1.0 - alpha) * (u + exploration_bonus)
+        return {"utility": u, "ucb": exploration_bonus, "retrieval_score": score}
 
-        cache = self._compute_skill_embeddings(mode)
-        n_skills = cache['embeddings'].shape[0]
-        if n_skills == 0:
-            return [([], [], [], []) for _ in task_descriptions]
+    def _enrich_remote_result_with_ranking_meta(
+        self, result_list: List[Dict[str, Any]], pool_key: str
+    ) -> List[Dict[str, Any]]:
+        """
+        After remote retrieval, attach utility/ucb/retrieval_score using **client's** pool
+        so N = sum(retrieval_count) is from the client (updated by update_utilities_for_trajectory).
+        Server-side N is often 0 until reload_skills, which would make recorded UCB always 0.
+        """
+        pool = "task_skills" if pool_key == "task_skills" else "step_skills"
+        items = self.skills.get(pool, [])
+        skill_id_to_idx = {s.get("skill_id"): i for i, s in enumerate(items) if s.get("skill_id")}
+        for item in result_list:
+            skills = item.get(pool_key, [])
+            for sk in skills:
+                sid = sk.get("skill_id")
+                sim = sk.get("similarity")
+                if sim is None:
+                    continue
+                sim_val = float(sim)
+                if sid is not None and sid in skill_id_to_idx:
+                    idx = skill_id_to_idx[sid]
+                    meta = self._get_skill_ranking_meta(pool, idx, sim_val)
+                else:
+                    # Skill not in client pool (e.g. server has newer skills); still use client's N for UCB
+                    meta = self._get_skill_ranking_meta_unknown_skill(pool, sim_val)
+                sk.update(meta)
+        return result_list
 
-        models = self._embedding_models if self._num_gpus > 1 and self._embedding_models else [self._get_embedding_model()]
-        n_models = len(models)
+    def _get_skill_ranking_meta_unknown_skill(self, pool_name: str, sim_val: float) -> Dict[str, Any]:
+        """UCB/score for a skill not in client pool: use client's N, n=0 (so UCB = c*sqrt(log_N))."""
+        items = self.skills.get(pool_name, [])
+        u = 0.0
+        sim_norm = (float(sim_val) + 1.0) / 2.0 if float(sim_val) >= -1 else 0.0
+        alpha = self._retrieval_alpha
+        c = self._retrieval_ucb_c
+        if alpha is None:
+            return {"utility": u, "ucb": 0.0, "retrieval_score": sim_norm}
+        n = 0
+        N = sum(int(s.get("retrieval_count", 0)) for s in items)
+        log_N = math.log(1 + N) if N > 0 else 0.0
+        denom = 1 + n
+        exploration_bonus = c * (math.sqrt(log_N / denom) if log_N > 0 and denom > 0 else 0.0)
+        score = alpha * sim_norm + (1.0 - alpha) * (u + exploration_bonus)
+        return {"utility": u, "ucb": exploration_bonus, "retrieval_score": score}
 
-        if n_models <= 1:
-            model = models[0]
+    def retrieve_task_skills_batch(
+        self,
+        task_descriptions: List[str],
+        top_k: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve top-k task_skills for each task description (by retrieval_obs). Returns list of { task_skills: [...], query_text: task }."""
+        pool = "task_skills"
+        items = self.skills.get(pool, [])
+        if not items:
+            return [{"task_skills": [], "query_text": t} for t in task_descriptions]
+        if self.retrieval_mode == "embedding" and self._retrieval_service_urls:
+            timeout = getattr(self, "_retrieval_timeout", 60)
+            return self._remote_retrieve_batch(
+                task_descriptions, top_k=top_k, timeout=timeout, pool="task_skills"
+            )
+        if self.retrieval_mode == "embedding":
+            import numpy as np
+            cache = self._compute_pool_embeddings(pool)
+            if cache["embeddings"].size == 0:
+                return [{"task_skills": [], "query_text": t} for t in task_descriptions]
+            model = self._get_embedding_model()
             query_embs = model.encode(
                 task_descriptions,
                 normalize_embeddings=True,
                 show_progress_bar=False,
                 convert_to_numpy=True,
             )
-        else:
-            # Split queries across GPUs and encode in parallel
-            def _encode_chunk(model, chunk):
-                if not chunk:
-                    return None
-                return model.encode(
-                    chunk,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                )
+            if hasattr(query_embs, "shape") and len(query_embs.shape) == 1:
+                query_embs = np.expand_dims(query_embs, axis=0)
+            sims = cache["embeddings"] @ query_embs.T
+            top_2k = self._retrieval_top_2k if self._retrieval_top_2k is not None else max(2 * top_k, top_k + 1)
+            top_2k = min(top_2k, len(cache["items"]))
+            out = []
+            for j in range(len(task_descriptions)):
+                s = np.asarray(sims[:, j]).ravel()
+                idx_2k = np.lexsort((-np.arange(len(s)), -s))[:top_2k].tolist()
+                if self._retrieval_alpha is not None:
+                    idx_final = self._apply_simutil_ucb(pool, idx_2k, s, top_k)
+                else:
+                    idx_final = idx_2k[:top_k]
+                skills = []
+                for i in idx_final:
+                    sk = dict(cache["items"][int(i)])
+                    sk["similarity"] = float(s[int(i)])
+                    sk.update(self._get_skill_ranking_meta(pool, int(i), float(s[int(i)])))
+                    if self.similarity_threshold is None or sk["similarity"] >= self.similarity_threshold:
+                        skills.append(sk)
+                out.append({"task_skills": skills, "query_text": task_descriptions[j]})
+            return out
+        # Template: return first top_k
+        return [{"task_skills": [dict(s) for s in items[:top_k]], "query_text": t} for t in task_descriptions]
 
-            size = len(task_descriptions)
-            chunk_size = (size + n_models - 1) // n_models
-            chunks = [
-                task_descriptions[i : i + chunk_size]
-                for i in range(0, size, chunk_size)
-            ]
-            while len(chunks) < n_models:
-                chunks.append([])
-            chunks = chunks[:n_models]
-            parts = []
-            with ThreadPoolExecutor(max_workers=n_models) as ex:
-                futs = {ex.submit(_encode_chunk, models[i], chunks[i]): i for i in range(n_models)}
-                for fut in as_completed(futs):
-                    idx = futs[fut]
-                    part = fut.result()
-                    if part is not None and getattr(part, "shape", None) and len(part.shape) > 0 and part.shape[0] > 0:
-                        parts.append((idx, part))
-            parts.sort(key=lambda x: x[0])
-            query_embs = np.vstack([p[1] for p in parts])
-        if hasattr(query_embs, 'shape') and len(query_embs.shape) == 1:
-            query_embs = np.expand_dims(query_embs, axis=0)
-        n_queries = len(task_descriptions)
-        n_general = cache['n_general']
-        n_skills = cache['embeddings'].shape[0]
-
-        sims_all = cache['embeddings'] @ query_embs.T
-        if hasattr(sims_all, 'shape') and len(sims_all.shape) == 1:
-            sims_all = np.expand_dims(sims_all, axis=1)
-
-        results = []
-        for j in range(n_queries):
-            sims = sims_all[:, j]
-            general_sims = sims[:n_general]
-            task_sims = sims[n_general:]
-            general_idx = np.argsort(general_sims)[::-1][:top_k_general]
-            task_idx = np.argsort(task_sims)[::-1][:top_k_task_specific]
-            general_skills = [cache['items'][int(i)][2] for i in general_idx]
-            task_skills = [cache['items'][n_general + int(i)][2] for i in task_idx]
-            general_scores = [float(general_sims[i]) for i in general_idx]
-            task_scores = [float(task_sims[i]) for i in task_idx]
-            results.append((general_skills, task_skills, general_scores, task_scores))
-        return results
+    def retrieve_step_skills_batch(
+        self,
+        query_texts: List[str],
+        top_k: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve top-k step_skills for each query (task + Current observation: obs). Returns list of { step_skills: [...], query_text: query }."""
+        pool = "step_skills"
+        items = self.skills.get(pool, [])
+        if not items:
+            return [{"step_skills": [], "query_text": q} for q in query_texts]
+        if self.retrieval_mode == "embedding" and self._retrieval_service_urls:
+            timeout = getattr(self, "_retrieval_timeout", 60)
+            return self._remote_retrieve_batch(
+                query_texts, top_k=top_k, timeout=timeout, pool="step_skills"
+            )
+        if self.retrieval_mode == "embedding":
+            import numpy as np
+            cache = self._compute_pool_embeddings(pool)
+            if cache["embeddings"].size == 0:
+                return [{"step_skills": [], "query_text": q} for q in query_texts]
+            model = self._get_embedding_model()
+            query_embs = model.encode(
+                query_texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            if hasattr(query_embs, "shape") and len(query_embs.shape) == 1:
+                query_embs = np.expand_dims(query_embs, axis=0)
+            sims = cache["embeddings"] @ query_embs.T
+            top_2k = self._retrieval_top_2k if self._retrieval_top_2k is not None else max(2 * top_k, top_k + 1)
+            top_2k = min(top_2k, len(cache["items"]))
+            out = []
+            for j in range(len(query_texts)):
+                s = np.asarray(sims[:, j]).ravel()
+                idx_2k = np.lexsort((-np.arange(len(s)), -s))[:top_2k].tolist()
+                if self._retrieval_alpha is not None:
+                    idx_final = self._apply_simutil_ucb(pool, idx_2k, s, top_k)
+                else:
+                    idx_final = idx_2k[:top_k]
+                skills = []
+                for i in idx_final:
+                    sk = dict(cache["items"][int(i)])
+                    sk["similarity"] = float(s[int(i)])
+                    sk.update(self._get_skill_ranking_meta(pool, int(i), float(s[int(i)])))
+                    if self.similarity_threshold is None or sk["similarity"] >= self.similarity_threshold:
+                        skills.append(sk)
+                out.append({"step_skills": skills, "query_text": query_texts[j]})
+            return out
+        return [{"step_skills": [dict(s) for s in items[:top_k]], "query_text": q} for q in query_texts]
 
     def _remote_retrieve_batch(
         self,
         task_descriptions: List[str],
         top_k: int = 6,
-        timeout: int = 60,
+        timeout: Optional[int] = None,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
@@ -502,6 +574,7 @@ class SkillsOnlyMemory(BaseMemory):
         import requests
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        timeout = timeout if timeout is not None else self._retrieval_timeout
         urls = self._retrieval_service_urls
         n = len(urls)
 
@@ -509,13 +582,15 @@ class SkillsOnlyMemory(BaseMemory):
             u = u.rstrip("/")
             return u if "/retrieve_batch" in u else f"{u}/retrieve_batch"
 
-        def _request_one(url: str, queries: List[str]) -> List[Dict[str, Any]]:
+        def _request_one(url: str, queries: List[str], pool: Optional[str] = None) -> List[Dict[str, Any]]:
             payload = {
                 "queries": queries,
                 "top_k": top_k,
                 "task_specific_top_k": kwargs.get("task_specific_top_k") or self.task_specific_top_k,
                 "skill_text_for_retrieval": kwargs.get("skill_text_for_retrieval") or self._skill_text_for_retrieval,
             }
+            if pool is not None:
+                payload["pool"] = pool
             resp = requests.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
@@ -525,8 +600,29 @@ class SkillsOnlyMemory(BaseMemory):
 
         if n == 0:
             return []
+
+        def _apply_threshold_to_pool_result(result_list: List[Dict[str, Any]], pool_key: str) -> List[Dict[str, Any]]:
+            """After remote retrieval, filter by similarity_threshold on client (server does not apply it)."""
+            if self.similarity_threshold is None or not result_list:
+                return result_list
+            out_filtered = []
+            for item in result_list:
+                skills = item.get(pool_key, [])
+                filtered = [s for s in skills if s.get("similarity") is not None and s["similarity"] >= self.similarity_threshold]
+                out_filtered.append({**item, pool_key: filtered})
+            return out_filtered
+
+        raw = _request_one(_normalize_url(urls[0]), task_descriptions, kwargs.get("pool")) if n == 1 else None
         if n == 1:
-            return _request_one(_normalize_url(urls[0]), task_descriptions)
+            pool = kwargs.get("pool")
+            pool_key = "task_skills" if pool == "task_skills" else "step_skills"
+            if raw is not None:
+                raw = self._enrich_remote_result_with_ranking_meta(raw, pool_key)
+            if pool == "task_skills" and raw is not None:
+                return _apply_threshold_to_pool_result(raw, "task_skills")
+            if pool == "step_skills" and raw is not None:
+                return _apply_threshold_to_pool_result(raw, "step_skills")
+            return raw if raw is not None else []
 
         # Split queries across URLs (e.g. 128 -> 8 chunks of 16)
         size = len(task_descriptions)
@@ -542,8 +638,9 @@ class SkillsOnlyMemory(BaseMemory):
 
         results_by_idx: List[Optional[List[Dict[str, Any]]]] = [None] * n
         with ThreadPoolExecutor(max_workers=n) as executor:
+            pool = kwargs.get("pool")
             futures = {
-                executor.submit(_request_one, _normalize_url(urls[i]), chunks[i]): i
+                executor.submit(_request_one, _normalize_url(urls[i]), chunks[i], pool): i
                 for i in range(n)
                 if chunks[i]
             }
@@ -555,230 +652,47 @@ class SkillsOnlyMemory(BaseMemory):
         for i in range(n):
             if results_by_idx[i] is not None:
                 out.extend(results_by_idx[i])
+        pool = kwargs.get("pool")
+        pool_key = "task_skills" if pool == "task_skills" else "step_skills"
+        if out:
+            out = self._enrich_remote_result_with_ranking_meta(out, pool_key)
+        if pool == "task_skills" and out:
+            return _apply_threshold_to_pool_result(out, "task_skills")
+        if pool == "step_skills" and out:
+            return _apply_threshold_to_pool_result(out, "step_skills")
         return out
 
     # ------------------------------------------------------------------ #
     # Public interface                                                     #
     # ------------------------------------------------------------------ #
 
-    def retrieve(
-        self,
-        task_description: str,
-        top_k: int = 6,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """
-        Retrieve skills for a given task description.
-
-        Args:
-            task_description: Current task goal string.
-            top_k:            Number of *general* skills to include.
-                              In embedding mode this also serves as the
-                              default for task-specific skills when
-                              ``task_specific_top_k`` is not set.
-
-        Returns:
-            Dictionary with keys:
-              - ``general_skills``       – list of skill dicts
-              - ``task_specific_skills`` – list of skill dicts
-              - ``mistakes_to_avoid``    – list of common-mistake dicts
-              - ``task_type``            – detected task type string
-              - ``task_specific_examples`` – always ``[]`` (reserved)
-              - ``retrieval_mode``       – which mode was used
-        """
-        common_mistakes = self.skills.get('common_mistakes', [])[:5]
-
-        # ----------------------------------------------------------------
-        # Embedding mode via remote service (no local model)
-        # ----------------------------------------------------------------
-        if self.retrieval_mode == "embedding" and self._retrieval_service_urls:
-            batch = self._remote_retrieve_batch([task_description], top_k=top_k, **kwargs)
-            if batch:
-                out = batch[0]
-                out.setdefault("mistakes_to_avoid", common_mistakes)
-                out.setdefault("query_text", task_description)
-                return out
-            return {
-                'query_text': task_description,
-                'general_skills': [],
-                'task_specific_skills': [],
-                'mistakes_to_avoid': common_mistakes,
-                'task_type': self._detect_task_type(task_description),
-                'task_specific_examples': [],
-                'retrieval_mode': 'embedding',
-            }
-
-        # ----------------------------------------------------------------
-        # Embedding mode: semantic ranking of all skills (in-process)
-        # ----------------------------------------------------------------
-        if self.retrieval_mode == "embedding":
-            ts_top_k = self.task_specific_top_k if self.task_specific_top_k is not None else top_k
-            res = self._embedding_retrieve(
-                task_description=task_description,
-                top_k_general=top_k,
-                top_k_task_specific=ts_top_k,
-            )
-            general_skills, task_skills = res[0], res[1]
-            general_scores = res[2] if len(res) >= 4 else [None] * len(general_skills)
-            task_scores = res[3] if len(res) >= 4 else [None] * len(task_skills)
-            gs = [{**dict(s), "similarity": general_scores[j]} for j, s in enumerate(general_skills)]
-            ts = [{**dict(s), "similarity": task_scores[j]} for j, s in enumerate(task_skills)]
-            gs, ts = self._apply_similarity_threshold(gs, ts)
-            task_type = self._detect_task_type(task_description)
-            return {
-                'query_text': task_description,
-                'general_skills': gs,
-                'task_specific_skills': ts,
-                'mistakes_to_avoid': common_mistakes,
-                'task_type': task_type,
-                'task_specific_examples': [],
-                'retrieval_mode': 'embedding',
-            }
-
-        # ----------------------------------------------------------------
-        # Template mode: keyword detection + return (sub)set of category skills
-        # ----------------------------------------------------------------
-        task_type = self._detect_task_type(task_description)
-        general_skills = self.skills.get('general_skills', [])[:top_k]
-        all_task_skills = self.skills.get('task_specific_skills', {}).get(task_type, [])
-
-        if self.task_specific_top_k is not None:
-            task_skills = all_task_skills[:self.task_specific_top_k]
-        else:
-            task_skills = all_task_skills
-        gs = [{**dict(s), "similarity": None} for s in general_skills]
-        ts = [{**dict(s), "similarity": None} for s in task_skills]
-        gs, ts = self._apply_similarity_threshold(gs, ts)
-        return {
-            'query_text': task_description,
-            'general_skills': gs,
-            'task_specific_skills': ts,
-            'mistakes_to_avoid': common_mistakes,
-            'task_type': task_type,
-            'task_specific_examples': [],
-            'retrieval_mode': 'template',
-        }
-
-    def retrieve_batch(
-        self,
-        task_descriptions: List[str],
-        top_k: int = 6,
-        **kwargs,
-    ) -> List[Dict[str, Any]]:
-        """
-        Retrieve skills for multiple task descriptions in one call (batch encode
-        in embedding mode). Returns one dict per query in the same order.
-
-        Args:
-            task_descriptions: List of task goal strings.
-            top_k: Number of general skills per query (same as retrieve).
-            **kwargs: Passed through to retrieve() in template mode; ignored in embedding mode.
-
-        Returns:
-            List of dicts with same structure as :meth:`retrieve`.
-        """
-        if not task_descriptions:
-            return []
-
-        common_mistakes = self.skills.get('common_mistakes', [])[:5]
-
-        if self.retrieval_mode == "embedding" and self._retrieval_service_urls:
-            kwargs.setdefault("skill_text_for_retrieval", self._skill_text_for_retrieval)
-            batch = self._remote_retrieve_batch(task_descriptions, top_k=top_k, **kwargs)
-            for i, d in enumerate(batch):
-                d.setdefault("mistakes_to_avoid", common_mistakes)
-                d.setdefault("query_text", task_descriptions[i] if i < len(task_descriptions) else "")
-                gs, ts = self._apply_similarity_threshold(
-                    d.get("general_skills", []), d.get("task_specific_skills", [])
-                )
-                d["general_skills"] = gs
-                d["task_specific_skills"] = ts
-            return batch
-
-        if self.retrieval_mode == "embedding":
-            ts_top_k = self.task_specific_top_k if self.task_specific_top_k is not None else top_k
-            mode = kwargs.get("skill_text_for_retrieval") or self._skill_text_for_retrieval
-            batch_results = self._embedding_retrieve_batch(
-                task_descriptions=task_descriptions,
-                top_k_general=top_k,
-                top_k_task_specific=ts_top_k,
-                mode=mode,
-            )
-            out = []
-            for i, res in enumerate(batch_results):
-                gs, ts = res[0], res[1]
-                g_scores = res[2] if len(res) >= 4 else [None] * len(gs)
-                t_scores = res[3] if len(res) >= 4 else [None] * len(ts)
-                gs_with_sim = [{**dict(s), "similarity": g_scores[j]} for j, s in enumerate(gs)]
-                ts_with_sim = [{**dict(s), "similarity": t_scores[j]} for j, s in enumerate(ts)]
-                gs_with_sim, ts_with_sim = self._apply_similarity_threshold(gs_with_sim, ts_with_sim)
-                out.append({
-                    'query_text': task_descriptions[i],
-                    'general_skills': gs_with_sim,
-                    'task_specific_skills': ts_with_sim,
-                    'mistakes_to_avoid': common_mistakes,
-                    'task_type': self._detect_task_type(task_descriptions[i]),
-                    'task_specific_examples': [],
-                    'retrieval_mode': 'embedding',
-                })
-            return out
-        return [self.retrieve(q, top_k=top_k, **kwargs) for q in task_descriptions]
-
     def format_for_prompt(self, retrieved_memories: Dict[str, Any]) -> str:
         """
-        Format retrieved skills into a string suitable for prompt injection.
-
-        Args:
-            retrieved_memories: Dict returned by :meth:`retrieve`.
-
-        Returns:
-            Formatted multi-section string to insert into the agent prompt.
+        Format retrieved skills (task_skills + step_skills) into a string for prompt injection.
         """
         sections = []
-        task_type = retrieved_memories.get('task_type', 'unknown')
-        mode = retrieved_memories.get('retrieval_mode', 'template')
-
-        # General skills
-        general_skills = retrieved_memories.get('general_skills', [])
-        if general_skills:
-            lines = ["### General Principles"]
-            for skill in general_skills:
-                title = skill.get('title', '')
-                principle = skill.get('principle', '')
-                lines.append(f"- **{title}**: {principle}")
-            sections.append("\n".join(lines))
-
-        # Task-specific skills
-        task_skills = retrieved_memories.get('task_specific_skills', [])
+        task_skills = retrieved_memories.get('task_skills', [])
         if task_skills:
-            if mode == "embedding":
-                section_title = "### Task-Relevant Skills"
-            else:
-                task_name = task_type.replace('_', ' ').title()
-                section_title = f"### {task_name} Skills"
-            lines = [section_title]
+            lines = ["### Task-level experience (for this kind of task)"]
             for skill in task_skills:
                 title = skill.get('title', '')
                 principle = skill.get('principle', '')
-                when = skill.get('when_to_apply', '')
+                # when = skill.get('when_to_apply', '')
                 lines.append(f"- **{title}**: {principle}")
-                if when:
-                    lines.append(f"  _Apply when: {when}_")
+                # if when:
+                #     lines.append(f"  _Apply when: {when}_")
             sections.append("\n".join(lines))
-
-        # Common mistakes
-        mistakes = retrieved_memories.get('mistakes_to_avoid', [])
-        if mistakes:
-            lines = ["### Mistakes to Avoid"]
-            for mistake in mistakes:
-                desc = mistake.get('description', '')
-                fix = mistake.get('how_to_avoid', '')
-                if desc:
-                    lines.append(f"- **Don't**: {desc}")
-                    if fix:
-                        lines.append(f"  **Instead**: {fix}")
+        step_skills = retrieved_memories.get('step_skills', [])
+        if step_skills:
+            lines = ["### Step-level experience (relevant to current situation)"]
+            for skill in step_skills:
+                title = skill.get('title', '')
+                principle = skill.get('principle', '')
+                # when = skill.get('when_to_apply', '')
+                lines.append(f"- **{title}**: {principle}")
+                # if when:
+                #     lines.append(f"  _Apply when: {when}_")
             sections.append("\n".join(lines))
-
         return "\n\n".join(sections) if sections else "No relevant skills found for this task."
 
     # ------------------------------------------------------------------ #
@@ -795,11 +709,7 @@ class SkillsOnlyMemory(BaseMemory):
         pass
 
     def __len__(self):
-        return (
-            len(self.skills.get('general_skills', [])) +
-            sum(len(v) for v in self.skills.get('task_specific_skills', {}).values()) +
-            len(self.skills.get('common_mistakes', []))
-        )
+        return len(self.skills.get('task_skills', [])) + len(self.skills.get('step_skills', []))
 
     def __getitem__(self, idx: int):
         return self.skills
@@ -808,87 +718,371 @@ class SkillsOnlyMemory(BaseMemory):
     # Dynamic update methods                                               #
     # ------------------------------------------------------------------ #
 
-    def add_skills(self, new_skills: List[Dict], category: str = 'general') -> int:
+    @staticmethod
+    def _normalize_skill_text(s: Any) -> str:
+        if s is None:
+            return ""
+        t = str(s).strip().lower()
+        return re.sub(r"\s+", " ", t)
+
+    def _skill_content_fingerprint(self, skill: Dict[str, Any]) -> str:
         """
-        Add new skills to the bank and invalidate the embedding cache.
+        Content key for deduplication: same title/principle/when_to_apply/retrieval_obs
+        => same skill (LLM often re-emits identical skills with new IDs across updates).
+        """
+        parts = [
+            self._normalize_skill_text(skill.get("retrieval_obs")),
+            self._normalize_skill_text(skill.get("title")),
+            self._normalize_skill_text(skill.get("principle")),
+            self._normalize_skill_text(skill.get("when_to_apply")),
+        ]
+        return "\x00".join(parts)
+
+    def _pool_content_fingerprints(self, pool_name: str) -> set:
+        seen = set()
+        for s in self.skills.get(pool_name, []):
+            fp = self._skill_content_fingerprint(s)
+            if fp:
+                seen.add(fp)
+        return seen
+
+    def _next_task_skill_id(self) -> str:
+        """Return next task_xxx id (task_001, task_002, ...)."""
+        pool = self.skills.get("task_skills", [])
+        max_n = 0
+        for s in pool:
+            sid = (s.get("skill_id") or "")
+            if sid.startswith("task_"):
+                try:
+                    max_n = max(max_n, int(sid[5:].lstrip("0") or "0"))
+                except ValueError:
+                    pass
+        return f"task_{max_n + 1:03d}"
+
+    def _next_step_skill_id(self) -> str:
+        """Return next step_xxx id (step_001, step_002, ...)."""
+        pool = self.skills.get("step_skills", [])
+        max_n = 0
+        for s in pool:
+            sid = (s.get("skill_id") or "")
+            if sid.startswith("step_"):
+                try:
+                    max_n = max(max_n, int(sid[5:].lstrip("0") or "0"))
+                except ValueError:
+                    pass
+        return f"step_{max_n + 1:03d}"
+
+    def add_skills(
+        self,
+        new_skills: List[Dict],
+        category: str = 'task',
+        created_at_step: Optional[int] = None,
+        dedupe_by_content: bool = True,
+    ) -> int:
+        """
+        Add new skills to the bank. category must be 'task' or 'step'.
 
         Args:
-            new_skills: List of skill dicts to add.
-            category:   ``'general'`` or a task-type key (e.g. ``'clean'``).
+            new_skills: List of skill dicts (title, principle, when_to_apply; retrieval_obs set by caller).
+            category:   'task' -> task_skills; 'step' -> step_skills.
+            created_at_step: Optional global step when adding (for created_at_step field); default 0.
+            dedupe_by_content: If True, skip skills whose normalized content matches an existing
+                or already-added skill in the same pool (avoids task_090 vs task_100 duplicates).
 
         Returns:
-            Number of skills actually added (duplicates are skipped).
+            Number of skills actually added (duplicates skipped).
         """
+        if category not in ("task", "step"):
+            raise ValueError(f"category must be 'task' or 'step', got {category!r}")
+        step = created_at_step if created_at_step is not None else DEFAULT_CREATED_AT_STEP
         added = 0
+        skipped_content = 0
         existing_ids = self._get_all_skill_ids()
-
+        pool_name = "task_skills" if category == "task" else "step_skills"
+        content_keys = self._pool_content_fingerprints(pool_name) if dedupe_by_content else set()
         for skill in new_skills:
-            skill_id = skill.get('skill_id')
-            if skill_id in existing_ids:
-                print(f"[SkillsOnlyMemory] Skipping duplicate skill: {skill_id}")
-                continue
-
-            if category == 'general':
-                self.skills.setdefault('general_skills', []).append(skill)
+            skill = dict(skill)
+            skill.setdefault("utility", DEFAULT_UTILITY)
+            skill.setdefault("retrieval_count", DEFAULT_RETRIEVAL_COUNT)
+            skill.setdefault("last_retrieval_step", DEFAULT_LAST_RETRIEVAL_STEP)
+            # 调用方传入 created_at_step 时强制写入当前训练步，避免 LLM/模板里带的 0 残留
+            if created_at_step is not None:
+                skill["created_at_step"] = int(created_at_step)
             else:
-                self.skills.setdefault('task_specific_skills', {}).setdefault(category, []).append(skill)
+                skill.setdefault("created_at_step", step)
+            fp = self._skill_content_fingerprint(skill) if dedupe_by_content else ""
+            if dedupe_by_content and fp in content_keys:
+                skipped_content += 1
+                continue
+            if category == "task":
+                skill["skill_id"] = skill.get("skill_id") or self._next_task_skill_id()
+                if skill["skill_id"] in existing_ids:
+                    continue
+                self.skills.setdefault("task_skills", []).append(skill)
+                existing_ids.add(skill["skill_id"])
+                if dedupe_by_content:
+                    content_keys.add(fp)
+                self._task_skill_embeddings_cache = None
+            else:
+                skill["skill_id"] = skill.get("skill_id") or self._next_step_skill_id()
+                if skill["skill_id"] in existing_ids:
+                    continue
+                self.skills.setdefault("step_skills", []).append(skill)
+                existing_ids.add(skill["skill_id"])
+                if dedupe_by_content:
+                    content_keys.add(fp)
+                self._step_skill_embeddings_cache = None
             added += 1
-            print(f"[SkillsOnlyMemory] Added skill: {skill_id} - {skill.get('title', 'N/A')}")
-
-        if added > 0:
-            # Invalidate embedding cache so it is recomputed on next retrieve
-            self._skill_embeddings_cache = {}
-
+        if skipped_content:
+            print(f"[SkillsOnlyMemory] Skipped {skipped_content} skill(s) (duplicate content in {pool_name})")
         return added
 
     def remove_skill(self, skill_id: str) -> bool:
         """Remove a skill by ID and invalidate the embedding cache."""
         removed = False
-
-        original_len = len(self.skills.get('general_skills', []))
-        self.skills['general_skills'] = [
-            s for s in self.skills.get('general_skills', [])
-            if s.get('skill_id') != skill_id
-        ]
-        if len(self.skills.get('general_skills', [])) < original_len:
-            removed = True
-
-        for task_type in self.skills.get('task_specific_skills', {}):
-            original_len = len(self.skills['task_specific_skills'][task_type])
-            self.skills['task_specific_skills'][task_type] = [
-                s for s in self.skills['task_specific_skills'][task_type]
-                if s.get('skill_id') != skill_id
-            ]
-            if len(self.skills['task_specific_skills'][task_type]) < original_len:
+        for pool_name in ("task_skills", "step_skills"):
+            pool = self.skills.get(pool_name, [])
+            self.skills[pool_name] = [s for s in pool if s.get("skill_id") != skill_id]
+            if len(self.skills[pool_name]) < len(pool):
                 removed = True
-
+                if pool_name == "task_skills":
+                    self._task_skill_embeddings_cache = None
+                else:
+                    self._step_skill_embeddings_cache = None
         if removed:
-            self._skill_embeddings_cache = {}
             print(f"[SkillsOnlyMemory] Removed skill: {skill_id}")
         return removed
 
+    def evict_excess_skills(
+        self,
+        current_step: int,
+        max_task_skills: Optional[int] = None,
+        max_step_skills: Optional[int] = None,
+        protect_recent_steps: int = 0,
+        score_c: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Shrink task_skills / step_skills pools when over max size.
+
+        Deletion order: among skills **not** created in the last ``protect_recent_steps``
+        (i.e. ``created_at_step <= current_step - protect_recent_steps``), sort by
+        ``utility + score_c * ucb_bonus`` **ascending** (smallest first), where
+        ``ucb_bonus`` uses the same formula as retrieval: ``c * sqrt(log(1+N)/(1+n))``
+        per pool with ``N = sum(retrieval_count)``, ``n = skill's retrieval_count``.
+
+        Returns:
+            Dict with removed skill records and counts for logging / JSON audit.
+        """
+        out: Dict[str, Any] = {
+            "current_step": int(current_step),
+            "removed": [],
+            "task_skills_before": 0,
+            "task_skills_after": 0,
+            "step_skills_before": 0,
+            "step_skills_after": 0,
+            "warnings": [],
+        }
+        c_ucb = float(self._retrieval_ucb_c)
+        protect_recent_steps = max(0, int(protect_recent_steps))
+        try:
+            score_c = float(score_c)
+            if math.isnan(score_c) or math.isinf(score_c):
+                score_c = 1.0
+        except (TypeError, ValueError):
+            score_c = 1.0
+        cutoff_created = int(current_step) - protect_recent_steps
+
+        def _evict_pool(pool_name: str, max_size: Optional[int]) -> None:
+            pool = self.skills.get(pool_name, [])
+            key_before = f"{pool_name.replace('_skills', '')}_skills_before"
+            key_after = f"{pool_name.replace('_skills', '')}_skills_after"
+            if max_size is None or max_size < 0:
+                n = len(pool)
+                out[key_before] = out[key_after] = n
+                return
+            out[key_before] = len(pool)
+            if len(pool) <= max_size:
+                out[key_after] = len(pool)
+                return
+            excess = len(pool) - max_size
+            N = sum(int(s.get("retrieval_count", 0)) for s in pool)
+            log_N = math.log(1 + N) if N > 0 else 0.0
+            # 一律按下标删，避免池中重复 skill_id 时按 id 删会多删
+            candidates: List[Tuple[float, int, Dict[str, Any]]] = []
+            for idx, skill in enumerate(pool):
+                if not isinstance(skill, dict):
+                    continue
+                try:
+                    self._normalize_skill_meta(skill)
+                    created = int(skill.get("created_at_step", 0) or 0)
+                    if created > cutoff_created:
+                        continue
+                    u = float(skill.get("utility", 0))
+                    if math.isnan(u) or math.isinf(u):
+                        u = 0.0
+                    n = int(skill.get("retrieval_count", 0))
+                    denom = 1 + n
+                    ucb_bonus = c_ucb * (math.sqrt(log_N / denom) if log_N > 0 and denom > 0 else 0.0)
+                    sort_key = u + score_c * ucb_bonus
+                    if math.isnan(sort_key) or math.isinf(sort_key):
+                        sort_key = u
+                    candidates.append((sort_key, idx, skill))
+                except (TypeError, ValueError):
+                    continue
+            candidates.sort(key=lambda x: x[0])
+            picked = candidates[:excess]
+            remove_idx = {c[1] for c in picked}
+            if len(picked) < excess:
+                out["warnings"].append(
+                    f"{pool_name}: need_remove={excess} but only {len(picked)} deletable "
+                    f"(protected by recent_steps={protect_recent_steps}); pool may stay above max."
+                )
+            if not picked:
+                out[key_after] = len(pool)
+                return
+
+            self.skills[pool_name] = [s for i, s in enumerate(pool) if i not in remove_idx]
+            if pool_name == "task_skills":
+                self._task_skill_embeddings_cache = None
+            else:
+                self._step_skill_embeddings_cache = None
+            for sort_key, pidx, skill in picked:
+                try:
+                    sk = float(sort_key)
+                    if math.isnan(sk) or math.isinf(sk):
+                        sk = 0.0
+                except (TypeError, ValueError):
+                    sk = 0.0
+                try:
+                    uu = float(skill.get("utility", 0) or 0)
+                    if math.isnan(uu) or math.isinf(uu):
+                        uu = 0.0
+                except (TypeError, ValueError):
+                    uu = 0.0
+                try:
+                    rc = int(skill.get("retrieval_count", 0) or 0)
+                except (TypeError, ValueError):
+                    rc = 0
+                try:
+                    cas = int(skill.get("created_at_step", 0) or 0)
+                except (TypeError, ValueError):
+                    cas = 0
+                out["removed"].append(
+                    {
+                        "pool": pool_name,
+                        "pool_index": int(pidx),
+                        "skill_id": skill.get("skill_id") or f"(no_id_index={pidx})",
+                        "title": (str(skill.get("title") or ""))[:500],
+                        "utility": uu,
+                        "retrieval_count": rc,
+                        "created_at_step": cas,
+                        "eviction_sort_key": sk,
+                    }
+                )
+            out[key_after] = len(self.skills[pool_name])
+            print(
+                f"[SkillsOnlyMemory] Evicted {len(picked)} from {pool_name} "
+                f"({out[key_before]} -> {out[key_after]}, max={max_size})"
+            )
+
+        _evict_pool("task_skills", max_task_skills)
+        _evict_pool("step_skills", max_step_skills)
+        return out
+
+    def update_utilities_for_trajectory(
+        self,
+        skill_ids: List[str],
+        credit: float,
+        global_step: int,
+        beta: float,
+    ) -> int:
+        """
+        Update utility (EMA), retrieval_count, and last_retrieval_step for each skill
+        that was retrieved in a trajectory. Used after rollout: credit = success (or success - baseline).
+
+        new_utility = (1 - beta) * current_utility + beta * credit;
+        retrieval_count += 1; last_retrieval_step = global_step.
+
+        Args:
+            skill_ids: Unique skill_id list (task + step skills retrieved in this trajectory).
+            credit: Single credit for this trajectory (e.g. success 0/1 or success - success_baseline).
+            global_step: Current training step.
+            beta: EMA step size (e.g. 0.05--0.3).
+
+        Returns:
+            Number of skills updated.
+        """
+        if not skill_ids or beta <= 0:
+            return 0
+        seen: set = set()
+        updated = 0
+        for pool_name in ("task_skills", "step_skills"):
+            for skill in self.skills.get(pool_name, []):
+                sid = skill.get("skill_id")
+                if sid not in skill_ids or sid in seen:
+                    continue
+                seen.add(sid)
+                self._normalize_skill_meta(skill)
+                u = float(skill.get("utility", 0))
+                skill["utility"] = (1.0 - beta) * u + beta * credit
+                skill["retrieval_count"] = int(skill.get("retrieval_count", 0)) + 1
+                skill["last_retrieval_step"] = global_step
+                updated += 1
+        return updated
+
     def save_skills(self, path: str):
         """Persist the current skill bank to a JSON file."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
         with open(path, 'w') as f:
             json.dump(self.skills, f, indent=2)
         print(f"[SkillsOnlyMemory] Saved {len(self)} skills to {path}")
 
+    def load_skills(self, path: str) -> bool:
+        """
+        Load skill bank from a JSON file (e.g. updated_skills_train_stepN.json).
+        Use when resuming training to restore the skill state saved at checkpoint.
+
+        Args:
+            path: Path to the skills JSON file.
+
+        Returns:
+            True if loaded successfully, False if file not found or load failed.
+        """
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            with open(path, 'r') as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                return False
+            self.skills = {
+                'task_skills': loaded.get('task_skills') or [],
+                'step_skills': loaded.get('step_skills') or [],
+            }
+            self._normalize_all_skill_meta()
+            self._task_skill_embeddings_cache = None
+            self._step_skill_embeddings_cache = None
+            print(f"[SkillsOnlyMemory] Loaded {len(self)} skills from {path}")
+            return True
+        except Exception as e:
+            print(f"[SkillsOnlyMemory] Failed to load skills from {path}: {e}")
+            return False
+
     def _get_all_skill_ids(self) -> set:
         ids = set()
-        for s in self.skills.get('general_skills', []):
+        for s in self.skills.get('task_skills', []):
             if s.get('skill_id'):
                 ids.add(s['skill_id'])
-        for task_skills in self.skills.get('task_specific_skills', {}).values():
-            for s in task_skills:
-                if s.get('skill_id'):
-                    ids.add(s['skill_id'])
+        for s in self.skills.get('step_skills', []):
+            if s.get('skill_id'):
+                ids.add(s['skill_id'])
         return ids
 
     def get_skill_count(self) -> Dict[str, int]:
         return {
-            'general': len(self.skills.get('general_skills', [])),
-            'task_specific': sum(len(v) for v in self.skills.get('task_specific_skills', {}).values()),
-            'common_mistakes': len(self.skills.get('common_mistakes', [])),
+            'task_skills': len(self.skills.get('task_skills', [])),
+            'step_skills': len(self.skills.get('step_skills', [])),
             'total': len(self),
         }

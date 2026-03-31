@@ -16,7 +16,7 @@
 import torch
 import numpy as np
 import random
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import math
 from PIL import Image
 from verl import DataProto
@@ -138,6 +138,7 @@ def filter_group_data(batch_list : List[Dict],
                         tool_callings: np.ndarray,
                         config,
                         last_try: bool = False,
+                        with_skills_per_traj: Optional[np.ndarray] = None,
                         ):
     """
     Dynamic Sampling:
@@ -145,7 +146,7 @@ def filter_group_data(batch_list : List[Dict],
     Adopted from DAPO (https://arxiv.org/abs/2503.14476)
     """
     if last_try:
-        return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
+        return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, with_skills_per_traj
     
     batch_size = config.data.train_batch_size
     group_n = config.env.rollout.n
@@ -180,6 +181,8 @@ def filter_group_data(batch_list : List[Dict],
     # success = {key: value[keep_indices] for key, value in success.items()}
     traj_uid = traj_uid[keep_indices]
     tool_callings = tool_callings[keep_indices]
+    if with_skills_per_traj is not None:
+        with_skills_per_traj = np.asarray(with_skills_per_traj)[keep_indices]
 
-    return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
+    return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, with_skills_per_traj
 

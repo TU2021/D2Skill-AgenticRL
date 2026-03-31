@@ -75,6 +75,62 @@ You should first reason step-by-step about the current situation — observe the
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
+SOKOBAN_TEMPLATE_WITH_MEMORY = """
+You are an expert agent operating in the Sokoban environment.
+
+# Task
+Your task is to push all boxes onto target spots.
+
+# Symbols and Their Meaning
+- Walls (`#`): These block movement. You cannot move through or push into walls.
+- Floor (`_`): Open spaces where you can walk and move boxes.
+- Targets (`O`): The spots where boxes need to go.
+- Boxes (`X`): The objects you need to push.
+- Player (`P`): You.
+- Box on Target (`√`): A box already on a target.
+- Player on Target (`S`): You standing on a target.
+
+====================
+## Current Progress
+====================
+
+You have already taken {step_count} step(s).
+
+Recent interaction history (observation -> action):
+{action_history}
+
+Current step: {current_step}
+
+Current observation:
+{current_observation}
+
+Admissible actions:
+["up", "down", "left", "right"]
+
+====================
+## Relevant Experience
+====================
+
+Below are retrieved skills that may help your current decision.
+Use them only when they match your current board state.
+
+Retrieved experiences:
+{retrieved_memories}
+
+====================
+## Instructions
+====================
+
+For this step:
+1. Analyze the current board state.
+2. Check whether retrieved experiences apply to this state.
+3. Choose one admissible action that moves toward solving the puzzle.
+
+Now it's your turn to make a move (choose ONE action only for the current step).
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
+
 SOKOBAN_VISUAL_TEMPLATE = """
 You are an expert agent operating in the Sokoban environment. Your goal is to push all the boxes onto the target spots. Once all boxes are on the targets, you win!
 
@@ -94,5 +150,31 @@ Your admissible actions are ["up", "down", "left", "right"].
 
 Now it's your turn to make a move (choose ONE action only for the current step).
 You should first reason step-by-step about the current situation — observe the positions of boxes and targets, plan a path to push a box toward a target, and avoid traps like corners or walls. This reasoning process MUST be enclosed within <think> </think> tags. 
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
+
+SOKOBAN_VISUAL_TEMPLATE_WITH_MEMORY = """
+You are an expert agent operating in the Sokoban environment. Your goal is to push all the boxes onto the target spots. Once all boxes are on targets, you win.
+
+# Rules
+You can only push boxes (no pulling).
+Avoid pushing boxes into dead corners or wall-locked positions.
+
+====================
+## Relevant Experience
+====================
+
+Retrieved experiences:
+{retrieved_memories}
+
+====================
+## Current Step
+====================
+
+Your current observation is shown in the image: <image>
+Admissible actions are ["up", "down", "left", "right"].
+
+Now it's your turn to make a move (choose ONE action only for the current step).
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """

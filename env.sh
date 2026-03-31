@@ -55,6 +55,7 @@ export ALFWORLD_DATA=/data/home/zdhs0006/.cache/alfworld
 
 export OPENAI_BASE_URL="https://4zapi.com/v1"
 export OPENAI_API_KEY="sk-dNeY9OrVduTbEUxAgCocvbGARCb87jROWV70jFk3z5w7goIk"
-export OPENAI_MODEL="gemini-3-flash-preview"
-#"o3" 
+# export OPENAI_MODEL="gemini-3-flash-preview"
+export OPENAI_MODEL="o3" 
+# export OPENAI_MODEL="gemini-3.1-pro-preview" 
 # export SUMMARIZER_OPENAI_MODEL="gemini-3-flash-preview" 

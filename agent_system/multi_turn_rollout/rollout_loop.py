@@ -23,8 +23,44 @@ from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+
+def _skill_input_to_retrieval(s: Dict[str, Any], mode: str = "full") -> str:
+    """Text that was used as input (document side) for this skill in retrieval.
+    mode: 'full' = title + principle + when_to_apply; 'when_to_apply' = only when_to_apply; 'principle' = only principle.
+    """
+    if mode == "when_to_apply":
+        return (s.get("when_to_apply") or "").strip()
+    if mode == "principle":
+        return (s.get("principle") or "").strip()
+    parts = [s.get("title", ""), s.get("principle", ""), s.get("when_to_apply", "")]
+    return ". ".join(p for p in parts if p and str(p).strip()).strip(". ")
+
+
+def _task_step_skill_row(s: Dict[str, Any]) -> Dict[str, Any]:
+    """One row for task_skill or step_skill in snapshot (skill_id, title, input_to_retrieval, similarity, utility, ucb, retrieval_score)."""
+    inp = (s.get("retrieval_obs") or "").strip() or _skill_input_to_retrieval(s, "full")
+    row = {"title": s.get("title", ""), "input_to_retrieval": inp, "similarity": s.get("similarity")}
+    if s.get("skill_id") is not None:
+        row["skill_id"] = s["skill_id"]
+    if "utility" in s:
+        row["utility"] = s["utility"]
+    if "ucb" in s:
+        row["ucb"] = s["ucb"]
+    if "retrieval_score" in s:
+        row["retrieval_score"] = s["retrieval_score"]
+    return row
+
+
+def _snapshot_retrieved_memories(mem: Dict[str, Any], skill_text_mode: str = "full") -> Dict[str, Any]:
+    """For JSON: query_text and per-skill task_skills, step_skills."""
+    return {
+        "query_text": mem.get("query_text", ""),
+        "task_skills": [_task_step_skill_row(s) for s in mem.get("task_skills", [])],
+        "step_skills": [_task_step_skill_row(s) for s in mem.get("step_skills", [])],
+    }
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -67,9 +103,11 @@ class TrajectoryCollector:
         obs_texts = obs.get('text', None)
         obs_images = obs.get('image', None)
         obs_anchors = obs.get('anchor', None)
+        obs_query_texts = obs.get('query_text', None)
         obs_text = obs_texts[item] if obs_texts is not None else None
         obs_image = obs_images[item] if obs_images is not None else None
         obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+        obs_query_text = (obs_query_texts[item] if obs_query_texts is not None and item < len(obs_query_texts) else None) or ""
         is_multi_modal = obs_image is not None
 
         _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
@@ -178,6 +216,7 @@ class TrajectoryCollector:
             'position_ids': position_ids[0],
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
+            'query_text': obs_query_text,
             'index': item,
             'data_source': data_source
         })
@@ -238,6 +277,10 @@ class TrajectoryCollector:
             success: Dict[str, np.ndarray],
             traj_uid: np.ndarray,
             tool_callings: np.ndarray,
+            per_step_retrieved: Optional[List[List[Dict]]] = None,
+            envs: Optional[Any] = None,
+            enable_dynamic_management: bool = False,
+            with_skills_per_traj: Optional[np.ndarray] = None,
             ) -> DataProto:
         """
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
@@ -254,10 +297,36 @@ class TrajectoryCollector:
         """
         batch_size = len(total_batch_list)
 
+        wsm_arr = with_skills_per_traj
+        if wsm_arr is None and envs is not None:
+            _w = getattr(envs, "with_skills_mask", None)
+            wsm_arr = np.asarray(_w, dtype=bool).copy() if _w is not None else None
+        if wsm_arr is not None:
+            wsm_arr = np.asarray(wsm_arr, dtype=bool).ravel()
+
         success_rate = {}
         for key, value in success.items():
             success_rate[key] = np.mean(value)
-        
+
+        # A/B rollout: split success for skill vs no-skill arms (logged as episode/success_rate_* via metric_utils)
+        if (
+            wsm_arr is not None
+            and "success_rate" in success
+            and wsm_arr.shape[0] == batch_size
+        ):
+            st = np.asarray(success["success_rate"], dtype=np.float64).ravel()
+            if st.shape[0] == batch_size:
+                skill_vals = st[wsm_arr]
+                origin_vals = st[~wsm_arr]
+                success_rate["success_rate_skill"] = np.array(
+                    [float(np.mean(skill_vals)) if skill_vals.size > 0 else float("nan")],
+                    dtype=np.float32,
+                )
+                success_rate["success_rate_origin"] = np.array(
+                    [float(np.mean(origin_vals)) if origin_vals.size > 0 else float("nan")],
+                    dtype=np.float32,
+                )
+
         effective_batch = []
         for bs in range(batch_size):
             # sum the rewards for each data in total_batch_list[bs]
@@ -273,6 +342,8 @@ class TrajectoryCollector:
                     # success_rate
                     for key, value in success_rate.items():
                         data[key] = value
+                    # trajectory index for intrinsic reward / utility (stable after balance_batch)
+                    data['traj_index'] = bs
 
                     effective_batch.append(data)
             
@@ -280,6 +351,32 @@ class TrajectoryCollector:
         gen_batch_output = DataProto.from_single_dict(
             data=collate_fn(effective_batch)
         )
+        # Per-step retrieval for recording only: always trajectory-level (len = num_trajectories).
+        # Trainer will pop this before adjust_batch so it never causes length mismatch.
+        if per_step_retrieved is not None:
+            # 必须存成 shape (n_traj,) 的 object 数组，每格是一条轨迹的 list[dict]。
+            # 若直接 np.array(list_of_lists) 且各轨迹步数相同，会变成 (n_traj, L) 二维矩阵，
+            # 后续 .ravel() 会把「按轨迹」变成「按步展平」，记录 JSON 时 sample_i 只剩全局第 i 个 step。
+            n_ps = len(per_step_retrieved)
+            _ps_store = np.empty(n_ps, dtype=object)
+            for _ii in range(n_ps):
+                _ps_store[_ii] = list(per_step_retrieved[_ii])
+            gen_batch_output.non_tensor_batch["per_step_retrieved_for_record"] = _ps_store
+
+        # When dynamic management is on: add trajectory-derived keys **expanded to row-level**
+        # so adjust_batch (select_idxs + concat) and balance_batch never see length mismatch.
+        if enable_dynamic_management:
+            traj_idx = np.asarray(gen_batch_output.non_tensor_batch.get("traj_index")).ravel().astype(np.int64)
+            num_rows = len(traj_idx)
+            if success and "success_rate" in success:
+                st = np.asarray(success["success_rate"])
+                gen_batch_output.non_tensor_batch["success_per_traj"] = st[traj_idx]
+            if wsm_arr is not None and wsm_arr.shape[0] == batch_size:
+                gen_batch_output.non_tensor_batch["with_skills_mask"] = wsm_arr[traj_idx]
+            if per_step_retrieved is not None:
+                gen_batch_output.non_tensor_batch["per_step_retrieved_by_traj"] = np.array(
+                    [per_step_retrieved[int(traj_idx[i])] for i in range(num_rows)], dtype=object
+                )
         return gen_batch_output
 
     def vanilla_multi_turn_loop(
@@ -304,21 +401,40 @@ class TrajectoryCollector:
         """
 
         batch_size = len(gen_batch.batch)
+        som_cfg = getattr(getattr(self.config, "env", None), "skills_only_memory", None) or {}
+        # Collect per-step retrievals when using step-level skills (step_only or task_step); envs.retrieved_memories
+        # is set in reset()/step() using that step's task+obs, so we snapshot after each step.
+        mode = (som_cfg.get("skill_gen_mode") or "task_step").strip().lower()
+        if mode not in ("task_only", "step_only", "task_step"):
+            mode = "task_step"
+        collect_per_step = (
+            getattr(envs, "retrieval_memory", None) is not None
+            and mode in ("step_only", "task_step")
+        )
+        per_step_retrieved: Optional[List[List[Dict]]] = [[] for _ in range(batch_size)] if collect_per_step else None
 
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
         assert len(gen_batch.batch) == lenght_obs, f"gen_batch size {len(gen_batch.batch)} does not match obs size {lenght_obs}"
-        
-        if self.config.env.rollout.n > 0: # env grouping
-            uid_batch = []
+
+        skill_text_mode = som_cfg.get("skill_text_for_retrieval", "full")
+        if collect_per_step and envs.retrieved_memories is not None:
             for i in range(batch_size):
-                if i % self.config.env.rollout.n == 0:
-                    uid = str(uuid.uuid4())
-                uid_batch.append(uid)
-            uid_batch = np.array(uid_batch, dtype=object)
-        else: # no env grouping, set all to the same uid
+                per_step_retrieved[i].append({"step": 0, **_snapshot_retrieved_memories(envs.retrieved_memories[i], skill_text_mode)})
+        
+        # uid = one per "problem" group; traj_uid = one per trajectory. So group_size trajectories share one uid.
+        rollout_n = int(getattr(self.config.env.rollout, 'n', 0) or 0)
+        if rollout_n > 0:
+            # Same uid for consecutive rollout_n indices (align with repeat interleave: traj 0..n-1 = group 0)
+            num_groups = (batch_size + rollout_n - 1) // rollout_n
+            group_uuids = [str(uuid.uuid4()) for _ in range(num_groups)]
+            uid_batch = np.array([group_uuids[i // rollout_n] for i in range(batch_size)], dtype=object)
+            if batch_size <= 64:  # only log when batch is small enough
+                n_unique = len(set(uid_batch.tolist()))
+                print(f"[Rollout] uid grouping: batch_size={batch_size}, rollout.n={rollout_n}, unique uids={n_unique} (expected {num_groups})")
+        else:
             uid = str(uuid.uuid4())
             uid_batch = np.array([uid for _ in range(len(gen_batch.batch))], dtype=object)
         is_done = np.zeros(batch_size, dtype=bool)
@@ -364,6 +480,12 @@ class TrajectoryCollector:
             
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
+            if collect_per_step and envs.retrieved_memories is not None:
+                for i in range(batch_size):
+                    per_step_retrieved[i].append({
+                        "step": _step + 1,
+                        **_snapshot_retrieved_memories(envs.retrieved_memories[i], skill_text_mode),
+                    })
             
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
@@ -386,7 +508,12 @@ class TrajectoryCollector:
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
-            
+            # expert_wrong_step: normally set later by trajectory-end LLM labeling (_apply_expert_wrong_step_from_llm);
+            # env may set info['expert_wrong_step'] for real-time signal; default False here, overwritten when using LLM path.
+            batch.non_tensor_batch['expert_wrong_step'] = np.array(
+                [info.get('expert_wrong_step', False) for info in infos], dtype=bool
+            )
+
             # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)
 
@@ -410,8 +537,11 @@ class TrajectoryCollector:
                     episode_rewards=episode_rewards, 
                     episode_lengths=episode_lengths,
                     )
-        
-        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
+        wsm_traj = getattr(envs, "with_skills_mask", None)
+        if wsm_traj is not None:
+            wsm_traj = np.asarray(wsm_traj, dtype=bool).copy()
+
+        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, per_step_retrieved, wsm_traj
     
     def dynamic_multi_turn_loop(
             self,
@@ -442,6 +572,7 @@ class TrajectoryCollector:
         total_success = []
         total_traj_uid = []
         total_tool_callings = []
+        total_wsm_chunks: List[np.ndarray] = []
         try_count: int = 0
         max_try_count = self.config.algorithm.filter_groups.max_num_gen_batches
 
@@ -451,12 +582,12 @@ class TrajectoryCollector:
                 print(f"valid num={len(total_batch_list)} < target num={self.config.data.train_batch_size * self.config.env.rollout.n}. Keep generating... ({try_count}/{max_try_count})")
             try_count += 1
 
-            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = self.vanilla_multi_turn_loop(
+            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, _, wsm_traj = self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
             )
-            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list, 
+            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, wsm_traj = filter_group_data(batch_list=batch_list, 
                                                                                                 episode_rewards=episode_rewards, 
                                                                                                 episode_lengths=episode_lengths, 
                                                                                                 success=success, 
@@ -464,6 +595,7 @@ class TrajectoryCollector:
                                                                                                 tool_callings=tool_callings, 
                                                                                                 config=self.config,
                                                                                                 last_try=(try_count == max_try_count),
+                                                                                                with_skills_per_traj=wsm_traj,
                                                                                                 )
             
             total_batch_list += batch_list
@@ -472,14 +604,17 @@ class TrajectoryCollector:
             total_success.append(success)
             total_traj_uid.append(traj_uid)
             total_tool_callings.append(tool_callings)
+            if wsm_traj is not None:
+                total_wsm_chunks.append(np.asarray(wsm_traj, dtype=bool))
 
         total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
         total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
         total_traj_uid = np.concatenate(total_traj_uid, axis=0)
         total_tool_callings = np.concatenate(total_tool_callings, axis=0)
+        total_wsm = np.concatenate(total_wsm_chunks, axis=0) if total_wsm_chunks else None
 
-        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
+        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings, total_wsm
 
     def multi_turn_loop(
             self,
@@ -504,17 +639,20 @@ class TrajectoryCollector:
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
             
         # Initial observations from the environment
+        per_step_retrieved = None
+        total_wsm: Optional[np.ndarray] = None
         if self.config.algorithm.filter_groups.enable and is_train:
             # Dynamic Sampling (for DAPO and Dynamic GiGPO)
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings, total_wsm = \
                 self.dynamic_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
             )
+            per_step_retrieved = None
         else:
             # Vanilla Sampling   
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings, per_step_retrieved, total_wsm = \
                 self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -527,6 +665,8 @@ class TrajectoryCollector:
         
 
         # Create trajectory data
+        som_cfg = (self.config.env.get("skills_only_memory") or {}) if hasattr(self.config, "env") else {}
+        enable_dynamic_management = bool(som_cfg.get("enable_dynamic_management", False))
         gen_batch_output: DataProto = self.gather_rollout_data(
             total_batch_list=total_batch_list,
             episode_rewards=total_episode_rewards,
@@ -534,6 +674,10 @@ class TrajectoryCollector:
             success=total_success,
             traj_uid=total_traj_uid,
             tool_callings=totoal_tool_callings,
+            per_step_retrieved=per_step_retrieved,
+            envs=envs,
+            enable_dynamic_management=enable_dynamic_management,
+            with_skills_per_traj=total_wsm,
         )
         
         return gen_batch_output
