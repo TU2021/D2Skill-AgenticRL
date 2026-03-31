@@ -9,6 +9,7 @@
 /swanlog/
 /models/
 /outputs/
+/train_sft/
 *.whl
 
 # Python cache/build artifacts
