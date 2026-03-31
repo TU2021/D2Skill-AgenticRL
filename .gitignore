@@ -11,6 +11,9 @@
 /outputs/
 /train_sft/
 /env.sh
+/2603.28716v1.pdf
+/README_old.md
+/run_alfworld_skills_management.log
 *.whl
 
 # Python cache/build artifacts
