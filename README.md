@@ -104,3 +104,15 @@ bash examples_d2skill/run_webshop_d2skill.sh
 
 Both scripts source `env.sh` at repo root.
 
+---
+
+## Citation
+
+```bibtex
+@article{tu2026d2skill,
+  title={Dynamic Dual-Granularity Skill Bank for Agentic RL},
+  author={Tu, Songjun and Xu, Chengdong and Zhang, Qichao and Zhang, Yaocheng and Lan, Xiangyuan and Li, Linjing and Zhao, Dongbin},
+  journal={arXiv preprint arXiv:2603.28716},
+  year={2026}
+}
+```
