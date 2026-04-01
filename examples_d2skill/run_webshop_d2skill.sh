@@ -103,7 +103,7 @@ python3 -m verl.trainer.main_ppo \
     +env.skills_only_memory.retrieval_mode=embedding \
     +env.skills_only_memory.skill_retrieval_service_url="$SKILL_RETRIEVAL_SERVICE_URL" \
     +env.skills_only_memory.skill_text_for_retrieval=when_to_apply \
-    +env.skills_only_memory.load_initial_skills=True \
+    +env.skills_only_memory.load_initial_skills=False \
     +env.skills_only_memory.similarity_threshold=0.7 \
     +env.skills_only_memory.top_k_task=1 \
     +env.skills_only_memory.top_k_step=1 \

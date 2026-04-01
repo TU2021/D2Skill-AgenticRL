@@ -1,7 +1,6 @@
 # D2Skill-AgenticRL
 
-Code release for our paper **Dynamic Dual-Granularity Skill Bank for Agentic RL**
-([arXiv:2603.28716](https://arxiv.org/abs/2603.28716)).
+Code release for our paper **Dynamic Dual-Granularity Skill Bank for Agentic RL**.
 
 <p align="center">
   <img src="figs/main.png" width="88%" alt="D2Skill Main Figure">
